@@ -8,6 +8,11 @@ import base64
 
 app = FastAPI()
 
+@app.get("/")
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "mensaje": "El robot está despierto y listo."}
+
 class Receptor(BaseModel):
     numDocumento: str
     nombre: str

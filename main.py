@@ -42,12 +42,10 @@ class FacturaRequest(BaseModel):
 
 TIPO_ITEM_MAP = {"1 - Bien": "1 - Bien", "2 - Servicio": "2 - Servicio", "3 - Bien y servicio": "3 - Bien y servicio"}
 
-# --- FUNCIÓN QUE TOMA FOTOS Y REPORTA EL ESTADO AL FRONTEND ---
 def reportar_paso(task_id, mensaje, page=None):
     b64_img = ""
     if page:
         try:
-            # Toma una captura rápida en calidad baja para no consumir internet
             img_bytes = page.screenshot(type="jpeg", quality=40)
             b64_img = base64.b64encode(img_bytes).decode("utf-8")
         except: pass
@@ -59,15 +57,6 @@ def fill_field(page, selector, value, timeout=5000):
         el = page.locator(selector).first
         el.wait_for(state="visible", timeout=timeout)
         el.fill(str(value))
-    except: pass
-
-def select_opt(page, selector, label=None, value=None, index=None, timeout=5000):
-    try:
-        el = page.locator(selector).first
-        el.wait_for(state="visible", timeout=timeout)
-        if label: el.select_option(label=label)
-        elif value: el.select_option(value=value)
-        elif index is not None: el.select_option(index=index)
     except: pass
 
 def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
@@ -86,7 +75,6 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
-            # OBLIGATORIO: Usar User-Agent de Windows para que Hacienda no bloquee el VPS de Render
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
@@ -153,35 +141,82 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             fill_field(page, "input[formcontrolname='nombre']", req.receptor.nombre)
             fill_field(page, "textarea[formcontrolname='complemento']", req.receptor.direccion)
 
-            reportar_paso(task_id, "Llenando productos de la factura...", page)
+            # ==========================================================
+            # SECCIÓN CORREGIDA: LLENADO DEL MODAL AZUL DE ÍTEMS
+            # ==========================================================
+            reportar_paso(task_id, "Abriendo panel de productos...", page)
             for i, item in enumerate(req.items):
                 if i == 0:
                     try:
                         page.locator("button:has-text('Agregar Detalle'), #btnGroupDrop2").first.click()
                         time.sleep(0.5)
                         page.locator("a.dropdown-item:has-text('Producto o Servicio')").first.click()
+                        page.wait_for_selector("div.modal-dialog", timeout=5000)
                         time.sleep(0.5)
                     except: pass
-                select_opt(page, "xpath=//label[contains(text(),'Tipo:')]/following-sibling::*//select", label=TIPO_ITEM_MAP.get(item.tipo_item, "1 - Bien"))
+                
+                reportar_paso(task_id, f"Llenando datos del producto {i+1}...", page)
+                
+                # 1. Tipo
+                try: page.locator("select[formcontrolname='tipo']").first.select_option(label=TIPO_ITEM_MAP.get(item.tipo_item, "1 - Bien"))
+                except: pass
+                
+                # 2. Cantidad
                 try:
                     ci = page.locator("input[formcontrolname='cantidad']").first
                     ci.clear(); ci.fill(str(item.cantidad)); ci.press("Tab")
                 except: pass
-                select_opt(page, "xpath=//label[contains(text(),'Unidad')]/following-sibling::*//select", label="Unidad")
-                fill_field(page, "input[formcontrolname='descripcion']", item.descripcion)
-                select_opt(page, "xpath=//label[contains(text(),'Tipo Venta')]/following-sibling::*//select", label=item.tipo_venta)
+                
+                # 3. Unidad
+                try: page.locator("select[formcontrolname='unidad']").first.select_option(label="Unidad")
+                except: pass
+                
+                # 4. Descripción del Producto (CORREGIDO: formcontrolname='producto')
                 try:
-                    pi = page.locator("input[formcontrolname='precioUnitario']").first
+                    desc_input = page.locator("input[formcontrolname='producto'], input[formcontrolname='descripcion'], input[placeholder='Nombre Producto']").first
+                    desc_input.clear(); desc_input.fill(item.descripcion)
+                except: pass
+                
+                # 5. Tipo Venta
+                try: page.locator("select[formcontrolname='tipoVenta']").first.select_option(label=item.tipo_venta)
+                except: pass
+                
+                # 6. Precio (CORREGIDO: formcontrolname='precio')
+                try:
+                    pi = page.locator("input[formcontrolname='precio'], input[formcontrolname='precioUnitario']").first
                     pi.clear(); pi.fill(f"{item.precio:.2f}"); pi.press("Tab")
+                    time.sleep(0.5) # Esperar a que se calcule el Total abajo
                 except: pass
-                try: page.locator("button.btn-primary:has-text('Agregar ítem'), button.btn-primary:has-text('Agregar Ítem')").last.click()
+                
+                reportar_paso(task_id, f"Guardando producto {i+1}...", page)
+                
+                # 7. Clic en "Agregar ítem"
+                try: 
+                    # Selector infalible basado en tu HTML
+                    btn_add = page.locator("button[ngbpopover='Adicionar al documento.'], button.btn-primary:has-text('Agregar ítem'), button.btn-primary:has-text('Agregar Ítem')").first
+                    btn_add.click(force=True)
+                    time.sleep(1.5)
                 except: pass
-                if i < len(req.items) - 1:
-                    try: page.locator("button:has-text('Seguir adicionando')").click()
-                    except: pass
-                else:
-                    try: page.locator("button:has-text('Regresar al documento')").click()
-                    except: pass
+                
+                # 8. Manejar el popup verde de éxito
+                try:
+                    if i < len(req.items) - 1:
+                        page.locator("button:has-text('Seguir adicionando')").first.click(force=True)
+                    else:
+                        page.locator("button:has-text('Regresar al documento'), button.swal2-confirm:has-text('OK')").first.click(force=True)
+                except: pass
+                
+                time.sleep(1)
+
+                # 9. RED DE SEGURIDAD: Si el modal azul sigue abierto tapando todo, forzamos el cierre
+                try:
+                    btn_cancelar = page.locator("button[data-dismiss='modal']:has-text('Cancelar')").first
+                    if btn_cancelar.is_visible():
+                        btn_cancelar.click(force=True)
+                        time.sleep(0.5)
+                except: pass
+            
+            # ==========================================================
 
             if not es_nota:
                 reportar_paso(task_id, "Configurando Forma de Pago...", page)
@@ -194,15 +229,30 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     mp = page.locator("input[formcontrolname='montoPago']").first
                     mp.clear(); mp.fill(f"{monto_pago:.2f}"); mp.press("Tab")
                 except: pass
-                try: page.locator("button.btn-block:has(i.fa-plus)").first.click(force=True)
+                
+                # CORREGIDO: Selector exacto para el botón +
+                try: 
+                    btn_plus = page.locator("button[tooltip='Agregar forma de pago'], button.btn-block:has(i.fa-plus)").first
+                    btn_plus.click(force=True)
+                    time.sleep(1)
                 except: pass
 
             reportar_paso(task_id, "Generando Documento Final...", page)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(0.5)
-            try: page.locator("input[type='submit'][value='Generar Documento'], button:has-text('Generar Documento')").last.click(force=True)
+            
+            # CORREGIDO: Selector exacto de Generar Documento
+            try: 
+                btn_gen = page.locator("input[value='Generar Documento'], button:has-text('Generar Documento')").first
+                btn_gen.click(force=True)
+                time.sleep(1)
             except: pass
-            try: page.locator("button.swal2-confirm:has-text('Si, crear documento')").first.click(force=True)
+            
+            # CORREGIDO: Selector exacto SweetAlert de confirmación
+            try: 
+                btn_confirm = page.locator("button.swal2-confirm:has-text('Si, crear documento')").first
+                btn_confirm.wait_for(state="visible", timeout=5000)
+                btn_confirm.click(force=True)
             except: pass
             
             reportar_paso(task_id, "Ingresando Clave Privada...", page)
@@ -210,7 +260,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 ic = page.get_by_placeholder("Ingrese la clave privada de validación")
                 ic.wait_for(state="visible", timeout=12000)
                 ic.fill(hw_clave)
-                bok = page.locator("button:has-text('OK')").last
+                bok = page.locator("button.swal2-confirm:has-text('OK')").last
                 bok.wait_for(state="visible", timeout=5000)
                 bok.click(force=True)
             except: pass
@@ -223,9 +273,19 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
                 return m.group(0).upper() if m else ""
 
+            try:
+                page.wait_for_selector(".swal2-popup, .swal2-content", timeout=20000)
+                time.sleep(1.5)
+                body_txt = page.inner_text("body")
+                if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
+                    raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta o inválida.")
+                codigo_generacion = _extract_uuid(body_txt)
+            except Exception as e:
+                if "Hacienda rechazó" in str(e): raise e
+
             t0 = time.time()
             pdf_tab = None
-            while time.time() - t0 < 20:
+            while time.time() - t0 < 10:
                 for pg in context.pages:
                     if "pdf" in pg.url.lower() or "blob:" in pg.url.lower():
                         pdf_tab = pg
@@ -234,8 +294,10 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 time.sleep(1)
 
             if pdf_tab:
-                codigo_generacion = _extract_uuid(pdf_tab.url)
-                if not codigo_generacion: codigo_generacion = _extract_uuid(pdf_tab.title())
+                if not codigo_generacion:
+                    codigo_generacion = _extract_uuid(pdf_tab.url)
+                    if not codigo_generacion:
+                        codigo_generacion = _extract_uuid(pdf_tab.title())
                 try:
                     pdf_bytes_js = pdf_tab.evaluate("""async () => {
                         const r = await fetch(document.URL);
@@ -244,15 +306,44 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
                 except: pass
 
-            if not codigo_generacion:
-                reportar_paso(task_id, "Buscando errores en la pantalla...", page)
+            for btn_txt in ["OK", "Aceptar", "Cerrar"]:
                 try:
-                    body_txt = page.inner_text("body")
-                    if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
-                        raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta.")
-                    codigo_generacion = _extract_uuid(body_txt)
-                except Exception as e:
-                    if "Hacienda rechazó" in str(e): raise e
+                    page.locator(f"button:has-text('{btn_txt}')").last.click(force=True, timeout=1000)
+                    time.sleep(0.3)
+                except: pass
+
+            if not pdf_base64 and codigo_generacion:
+                reportar_paso(task_id, "Recuperando PDF desde Consultas...", page)
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(page.url)
+                    base_url = f"{parsed.scheme}://{parsed.netloc}"
+                    page.goto(f"{base_url}/consultaDteEmitidos", wait_until="domcontentloaded")
+                    time.sleep(1)
+
+                    input_cod = page.locator("input[formcontrolname='codigoGeneracion'], input[placeholder*='0000']").first
+                    input_cod.wait_for(state="visible", timeout=10000)
+                    input_cod.fill(codigo_generacion)
+                    page.locator("button:has-text('Consultar')").first.click()
+                    page.wait_for_selector("tbody tr", timeout=15000)
+                    time.sleep(1.5)
+
+                    pages_antes = set(id(p) for p in context.pages)
+                    page.locator("button[tooltip='Versión legible'], button:has(i.fa-print)").first.click(force=True)
+                    time.sleep(3)
+
+                    for pg in context.pages:
+                        if id(pg) not in pages_antes or "pdf" in pg.url.lower() or "blob:" in pg.url.lower():
+                            try:
+                                pdf_bytes_js = pg.evaluate("""async () => {
+                                    const r = await fetch(document.URL);
+                                    const buf = await r.arrayBuffer();
+                                    return Array.from(new Uint8Array(buf));
+                                }""")
+                                pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
+                            except: pass
+                            break
+                except: pass
 
             if not codigo_generacion:
                 raise Exception("El portal de Hacienda no devolvió el UUID. Ver monitor para detalles.")
@@ -264,7 +355,6 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             }
 
     except Exception as e:
-        # SI OCURRE UN ERROR CRÍTICO, TOMAMOS FOTO FINAL DEL ERROR
         try: reportar_paso(task_id, f"ERROR CRÍTICO: {str(e)}", page)
         except: pass
         TAREAS[task_id] = {"status": "error", "exito": False, "detail": str(e), "screenshot": TAREAS[task_id].get("screenshot", "")}

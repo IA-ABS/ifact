@@ -4,14 +4,12 @@ from playwright.sync_api import sync_playwright
 import time, re, json, base64, uuid
 
 app = FastAPI()
-
-# Diccionario en memoria para guardar el progreso de las facturas
 TAREAS = {}
 
 @app.get("/")
 @app.get("/ping")
 def ping():
-    return {"status": "ok", "mensaje": "Robot despierto y rápido."}
+    return {"status": "ok", "mensaje": "Robot en línea y con cámaras encendidas."}
 
 class Receptor(BaseModel):
     numDocumento: str
@@ -44,6 +42,18 @@ class FacturaRequest(BaseModel):
 
 TIPO_ITEM_MAP = {"1 - Bien": "1 - Bien", "2 - Servicio": "2 - Servicio", "3 - Bien y servicio": "3 - Bien y servicio"}
 
+# --- FUNCIÓN QUE TOMA FOTOS Y REPORTA EL ESTADO AL FRONTEND ---
+def reportar_paso(task_id, mensaje, page=None):
+    b64_img = ""
+    if page:
+        try:
+            # Toma una captura rápida en calidad baja para no consumir internet
+            img_bytes = page.screenshot(type="jpeg", quality=40)
+            b64_img = base64.b64encode(img_bytes).decode("utf-8")
+        except: pass
+    TAREAS[task_id]["mensaje"] = mensaje
+    if b64_img: TAREAS[task_id]["screenshot"] = b64_img
+
 def fill_field(page, selector, value, timeout=5000):
     try:
         el = page.locator(selector).first
@@ -60,22 +70,12 @@ def select_opt(page, selector, label=None, value=None, index=None, timeout=5000)
         elif index is not None: el.select_option(index=index)
     except: pass
 
-# --- EL CÓDIGO PESADO DE PLAYWRIGHT SE EJECUTA EN SEGUNDO PLANO ---
 def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
-    TAREAS[task_id] = {"status": "procesando"}
+    TAREAS[task_id] = {"status": "procesando", "mensaje": "Iniciando navegador...", "screenshot": ""}
     
     hw_user = req.nit_empresa
     hw_pass = req.clave_hacienda
     hw_clave = req.clave_firma if req.clave_firma else req.clave_hacienda
-    nit_cli = req.receptor.numDocumento
-    nom_cli = req.receptor.nombre
-    nrc_cli = req.receptor.nrc
-    act_cli = req.receptor.codActividad
-    tipo_doc = "NIT"
-    depto = req.receptor.departamento
-    muni = req.receptor.municipio
-    dir_cli = req.receptor.direccion
-    mail_cli = req.receptor.correo
     tipo_dte = req.tipo_dte
     es_nota = tipo_dte in ("Nota de Crédito", "Nota de Débito")
     forma_pago = req.formas_pago[0] if req.formas_pago else "01"
@@ -86,80 +86,74 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
-            context = browser.new_context(viewport={"width": 1366, "height": 768}, accept_downloads=True)
+            # OBLIGATORIO: Usar User-Agent de Windows para que Hacienda no bloquee el VPS de Render
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1366, "height": 768},
+                accept_downloads=True
+            )
             page = context.new_page()
-            
-            # Bloquear imágenes para ir más rápido
-            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media"] else route.continue_())
+            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["media"] else route.continue_())
 
-            # 1. Login
+            reportar_paso(task_id, "Abriendo portal de Hacienda...", page)
             page.goto("https://factura.gob.sv/", wait_until="domcontentloaded")
+            
             with context.expect_page() as npi: page.click("text=Ingresar")
             page = npi.value
             page.wait_for_load_state("domcontentloaded")
+            
+            reportar_paso(task_id, "Iniciando sesión (Login)...", page)
             try: page.locator("//h5[contains(text(),'Emisores DTE')]/..//button").click()
             except: pass
             
             page.get_by_placeholder("NIT/DUI").fill(hw_user.replace("-", ""))
             page.locator("input[type='password']").fill(hw_pass)
             try:
-                sel_ambiente = page.locator("select[formcontrolname='ambiente']").first
-                sel_ambiente.wait_for(state="visible", timeout=3000)
-                sel_ambiente.select_option(value="/test")
+                page.locator("select[formcontrolname='ambiente']").first.select_option(value="/test")
                 time.sleep(0.5) 
             except: pass
 
             page.click("button:has-text('Iniciar sesión')")
-            try:
-                page.wait_for_selector(".swal2-confirm", timeout=3000)
-                page.click(".swal2-confirm")
+            try: page.wait_for_selector(".swal2-confirm", timeout=3000); page.click(".swal2-confirm")
             except: pass
 
-            # 2. Sistema Facturacion
+            reportar_paso(task_id, "Entrando al Sistema de Facturación...", page)
             try:
                 page.locator("text=Sistema de facturación").wait_for(state="visible", timeout=10000)
                 page.click("text=Sistema de facturación", force=True)
                 page.wait_for_load_state("domcontentloaded")
             except: pass
 
-            # 3. Tipo DTE
+            reportar_paso(task_id, f"Seleccionando tipo: {tipo_dte}", page)
             try:
                 page.wait_for_selector(".swal2-popup select, select.swal2-select", timeout=10000)
                 page.locator(".swal2-popup select, select.swal2-select").first.select_option(label=tipo_dte)
                 page.locator("button.swal2-confirm, button:has-text('OK')").first.click()
             except: pass
 
-            # 4. Receptor
-            is_ccf_or_nota = ("Crédito Fiscal" in tipo_dte) or es_nota
-            if not is_ccf_or_nota:
-                try: page.locator("select[formcontrolname='tipoDocumento']").first.select_option(label=tipo_doc)
+            reportar_paso(task_id, "Llenando datos del cliente...", page)
+            if not es_nota and not ("Crédito Fiscal" in tipo_dte):
+                try: page.locator("select[formcontrolname='tipoDocumento']").first.select_option(label="NIT")
                 except: pass
 
-            nit_clean = nit_cli.replace("-", "")
+            nit_clean = req.receptor.numDocumento.replace("-", "")
             try: page.locator("input[placeholder^='Digite el número de']").first.fill(nit_clean)
             except: fill_field(page, "input[formcontrolname='numDocumento']", nit_clean)
 
-            if is_ccf_or_nota:
-                if nrc_cli: fill_field(page, "input[formcontrolname='nrc']", nrc_cli.replace("-", ""))
-                if act_cli:
+            if ("Crédito Fiscal" in tipo_dte) or es_nota:
+                if req.receptor.nrc: fill_field(page, "input[formcontrolname='nrc']", req.receptor.nrc.replace("-", ""))
+                if req.receptor.codActividad:
                     try:
-                        cod_act = act_cli.split(" - ")[0].strip()
+                        cod = req.receptor.codActividad.split(" - ")[0].strip()
                         a = page.locator("ng-select[formcontrolname='actividadEconomica']").first
-                        a.click()
-                        a.locator("input").fill(cod_act)
-                        page.locator(f"div.ng-option:has-text('{cod_act}')").first.click()
+                        a.click(); a.locator("input").fill(cod)
+                        page.locator(f"div.ng-option:has-text('{cod}')").first.click()
                     except: pass
 
-            fill_field(page, "input[formcontrolname='nombre']", nom_cli)
-            try: page.locator("select[formcontrolname='departamento']").first.select_option(value=depto.split(" - ")[0].strip())
-            except: pass
-            try: page.locator("select[formcontrolname='municipio']").first.select_option(label=muni.split(" - ")[1].strip() if " - " in muni else muni)
-            except: pass
-            fill_field(page, "textarea[formcontrolname='complemento']", dir_cli)
-            try: page.locator("input[formcontrolname='correo']").first.fill(mail_cli)
-            except: pass
+            fill_field(page, "input[formcontrolname='nombre']", req.receptor.nombre)
+            fill_field(page, "textarea[formcontrolname='complemento']", req.receptor.direccion)
 
-            # 5. Items
+            reportar_paso(task_id, "Llenando productos de la factura...", page)
             for i, item in enumerate(req.items):
                 if i == 0:
                     try:
@@ -171,18 +165,14 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 select_opt(page, "xpath=//label[contains(text(),'Tipo:')]/following-sibling::*//select", label=TIPO_ITEM_MAP.get(item.tipo_item, "1 - Bien"))
                 try:
                     ci = page.locator("input[formcontrolname='cantidad']").first
-                    ci.clear()
-                    ci.fill(str(item.cantidad))
-                    ci.press("Tab")
+                    ci.clear(); ci.fill(str(item.cantidad)); ci.press("Tab")
                 except: pass
                 select_opt(page, "xpath=//label[contains(text(),'Unidad')]/following-sibling::*//select", label="Unidad")
                 fill_field(page, "input[formcontrolname='descripcion']", item.descripcion)
                 select_opt(page, "xpath=//label[contains(text(),'Tipo Venta')]/following-sibling::*//select", label=item.tipo_venta)
                 try:
                     pi = page.locator("input[formcontrolname='precioUnitario']").first
-                    pi.clear()
-                    pi.fill(f"{item.precio:.2f}")
-                    pi.press("Tab")
+                    pi.clear(); pi.fill(f"{item.precio:.2f}"); pi.press("Tab")
                 except: pass
                 try: page.locator("button.btn-primary:has-text('Agregar ítem'), button.btn-primary:has-text('Agregar Ítem')").last.click()
                 except: pass
@@ -193,8 +183,8 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     try: page.locator("button:has-text('Regresar al documento')").click()
                     except: pass
 
-            # 6. Pago
             if not es_nota:
+                reportar_paso(task_id, "Configurando Forma de Pago...", page)
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 time.sleep(0.5)
                 fp_val = {"01": "0: 01", "02": "3: 04", "03": "4: 05", "07": "1: 02", "99": "11: 99"}.get(forma_pago, "0: 01")
@@ -202,14 +192,12 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 except: pass
                 try:
                     mp = page.locator("input[formcontrolname='montoPago']").first
-                    mp.clear()
-                    mp.fill(f"{monto_pago:.2f}")
-                    mp.press("Tab")
+                    mp.clear(); mp.fill(f"{monto_pago:.2f}"); mp.press("Tab")
                 except: pass
                 try: page.locator("button.btn-block:has(i.fa-plus)").first.click(force=True)
                 except: pass
 
-            # 7. Generar
+            reportar_paso(task_id, "Generando Documento Final...", page)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(0.5)
             try: page.locator("input[type='submit'][value='Generar Documento'], button:has-text('Generar Documento')").last.click(force=True)
@@ -217,7 +205,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             try: page.locator("button.swal2-confirm:has-text('Si, crear documento')").first.click(force=True)
             except: pass
             
-            # 7.3 Clave privada
+            reportar_paso(task_id, "Ingresando Clave Privada...", page)
             try:
                 ic = page.get_by_placeholder("Ingrese la clave privada de validación")
                 ic.wait_for(state="visible", timeout=12000)
@@ -227,9 +215,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 bok.click(force=True)
             except: pass
 
-            # ==========================================================
-            # 8. ATRAPAR EL PDF AUTOMÁTICO Y EL UUID
-            # ==========================================================
+            reportar_paso(task_id, "Esperando respuesta oficial de Hacienda (UUID)...", page)
             codigo_generacion = ""
             pdf_base64 = ""
             
@@ -237,108 +223,55 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
                 return m.group(0).upper() if m else ""
 
-            # CLAVE 1: Esperar el Modal de Éxito de Hacienda (Esto faltaba en mi código anterior y es como lo hace tu Streamlit)
-            try:
-                page.wait_for_selector(".swal2-popup, .swal2-content", timeout=20000)
-                time.sleep(1.5)
-                body_txt = page.inner_text("body")
-                if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
-                    raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta o inválida.")
-                codigo_generacion = _extract_uuid(body_txt)
-            except Exception as e:
-                if "Hacienda rechazó" in str(e): raise e
-
-            # CLAVE 2: Buscar pestaña de PDF generada automáticamente
             t0 = time.time()
             pdf_tab = None
-            while time.time() - t0 < 10:
+            while time.time() - t0 < 20:
                 for pg in context.pages:
                     if "pdf" in pg.url.lower() or "blob:" in pg.url.lower():
                         pdf_tab = pg
                         break
-                if pdf_tab:
-                    break
+                if pdf_tab: break
                 time.sleep(1)
 
             if pdf_tab:
-                if not codigo_generacion:
-                    codigo_generacion = _extract_uuid(pdf_tab.url)
-                    if not codigo_generacion:
-                        codigo_generacion = _extract_uuid(pdf_tab.title())
+                codigo_generacion = _extract_uuid(pdf_tab.url)
+                if not codigo_generacion: codigo_generacion = _extract_uuid(pdf_tab.title())
                 try:
                     pdf_bytes_js = pdf_tab.evaluate("""async () => {
                         const r = await fetch(document.URL);
-                        const buf = await r.arrayBuffer();
-                        return Array.from(new Uint8Array(buf));
+                        const buf = await r.arrayBuffer(); return Array.from(new Uint8Array(buf));
                     }""")
                     pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
                 except: pass
 
-            # Cerramos los modales
-            for btn_txt in ["OK", "Aceptar", "Cerrar"]:
+            if not codigo_generacion:
+                reportar_paso(task_id, "Buscando errores en la pantalla...", page)
                 try:
-                    page.locator(f"button:has-text('{btn_txt}')").last.click(force=True, timeout=1000)
-                    time.sleep(0.3)
-                except: pass
+                    body_txt = page.inner_text("body")
+                    if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
+                        raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta.")
+                    codigo_generacion = _extract_uuid(body_txt)
+                except Exception as e:
+                    if "Hacienda rechazó" in str(e): raise e
 
             if not codigo_generacion:
-                raise Exception("El portal de Hacienda no devolvió el UUID. Verifica tu Clave Privada.")
-
-            # CLAVE 3: RED DE SEGURIDAD (FALLBACK A CONSULTAS)
-            # Solo si el servidor de Render bloqueó la pestaña emergente, vamos a Consultas para salvar el PDF.
-            if not pdf_base64:
-                try:
-                    from urllib.parse import urlparse
-                    parsed = urlparse(page.url)
-                    base_url = f"{parsed.scheme}://{parsed.netloc}"
-                    page.goto(f"{base_url}/consultaDteEmitidos", wait_until="domcontentloaded")
-                    time.sleep(1)
-
-                    input_cod = page.locator("input[formcontrolname='codigoGeneracion'], input[placeholder*='0000']").first
-                    input_cod.wait_for(state="visible", timeout=10000)
-                    input_cod.fill(codigo_generacion)
-                    
-                    page.locator("button:has-text('Consultar')").first.click()
-                    page.wait_for_selector("tbody tr", timeout=15000)
-                    time.sleep(1.5)
-
-                    pages_antes = set(id(p) for p in context.pages)
-                    page.locator("button[tooltip='Versión legible'], button:has(i.fa-print)").first.click(force=True)
-                    time.sleep(3)
-
-                    for pg in context.pages:
-                        if id(pg) not in pages_antes or "pdf" in pg.url.lower() or "blob:" in pg.url.lower():
-                            try:
-                                pdf_bytes_js = pg.evaluate("""async () => {
-                                    const r = await fetch(document.URL);
-                                    const buf = await r.arrayBuffer();
-                                    return Array.from(new Uint8Array(buf));
-                                }""")
-                                pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
-                            except: pass
-                            break
-                except: pass
+                raise Exception("El portal de Hacienda no devolvió el UUID. Ver monitor para detalles.")
 
             browser.close()
-
-            # Guardamos el éxito y terminamos
             TAREAS[task_id] = {
-                "status": "completado",
-                "exito": True,
-                "sello_recepcion": "IMPRESO-EN-EL-PDF", 
-                "codigo_generacion": codigo_generacion,
-                "pdf_base64": pdf_base64,
-                "json_content": "{}"
+                "status": "completado", "exito": True, "sello_recepcion": "IMPRESO-EN-EL-PDF", 
+                "codigo_generacion": codigo_generacion, "pdf_base64": pdf_base64, "json_content": "{}"
             }
 
     except Exception as e:
-        TAREAS[task_id] = {"status": "error", "exito": False, "detail": str(e)}
+        # SI OCURRE UN ERROR CRÍTICO, TOMAMOS FOTO FINAL DEL ERROR
+        try: reportar_paso(task_id, f"ERROR CRÍTICO: {str(e)}", page)
+        except: pass
+        TAREAS[task_id] = {"status": "error", "exito": False, "detail": str(e), "screenshot": TAREAS[task_id].get("screenshot", "")}
 
-# --- NUEVOS ENDPOINTS PARA CLOUDFLARE ---
 @app.post("/facturar")
 def facturar_inmediato(req: FacturaRequest, bg_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())
-    # Asignamos el trabajo a un hilo secundario y respondemos en 0.1 segundos a Cloudflare
     bg_tasks.add_task(procesar_dte_en_fondo, task_id, req)
     return {"exito": True, "task_id": task_id, "status": "procesando"}
 

@@ -11,7 +11,7 @@ TAREAS = {}
 @app.get("/")
 @app.get("/ping")
 def ping():
-    return {"status": "ok", "mensaje": "Robot despierto."}
+    return {"status": "ok", "mensaje": "Robot despierto y rápido."}
 
 class Receptor(BaseModel):
     numDocumento: str
@@ -60,7 +60,7 @@ def select_opt(page, selector, label=None, value=None, index=None, timeout=5000)
         elif index is not None: el.select_option(index=index)
     except: pass
 
-# --- EL CÓDIGO PESADO DE PLAYWRIGHT AHORA SE EJECUTA EN SEGUNDO PLANO ---
+# --- EL CÓDIGO PESADO DE PLAYWRIGHT SE EJECUTA EN SEGUNDO PLANO ---
 def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
     TAREAS[task_id] = {"status": "procesando"}
     
@@ -216,6 +216,8 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             except: pass
             try: page.locator("button.swal2-confirm:has-text('Si, crear documento')").first.click(force=True)
             except: pass
+            
+            # 7.3 Clave privada
             try:
                 ic = page.get_by_placeholder("Ingrese la clave privada de validación")
                 ic.wait_for(state="visible", timeout=12000)
@@ -226,7 +228,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             except: pass
 
             # ==========================================================
-            # 8. ATRAPAR EL PDF AUTOMÁTICO Y EL UUID
+            # 8. ATRAPAR EL PDF AUTOMÁTICO Y EL UUID (SÚPER RÁPIDO)
             # ==========================================================
             codigo_generacion = ""
             pdf_base64 = ""
@@ -235,12 +237,11 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
                 return m.group(0).upper() if m else ""
 
-            # Esperamos hasta 20 segundos a que Hacienda genere y abra la nueva pestaña con el PDF
+            # Esperamos hasta 20 segundos a que Hacienda abra la pestaña nueva con el PDF
             t0 = time.time()
             pdf_tab = None
             while time.time() - t0 < 20:
                 for pg in context.pages:
-                    # Buscamos la pestaña que tiene el PDF o el blob
                     if "pdf" in pg.url.lower() or "blob:" in pg.url.lower():
                         pdf_tab = pg
                         break
@@ -249,12 +250,12 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 time.sleep(1)
 
             if pdf_tab:
-                # 1. Sacamos el UUID de la URL del PDF
+                # 1. Sacamos el UUID de la URL de la nueva pestaña
                 codigo_generacion = _extract_uuid(pdf_tab.url)
                 if not codigo_generacion:
                     codigo_generacion = _extract_uuid(pdf_tab.title())
                 
-                # 2. Convertimos ese PDF a Base64 para enviarlo al Frontend
+                # 2. Descargamos el PDF a Base64
                 try:
                     pdf_bytes_js = pdf_tab.evaluate("""async () => {
                         const r = await fetch(document.URL);
@@ -264,12 +265,12 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
                 except: pass
 
-            # Si por alguna razón la pestaña no se abrió, leemos el error de la pantalla principal
+            # Si falla y no se abre pestaña, leemos el mensaje de la pantalla de Hacienda
             if not codigo_generacion:
                 try:
                     body_txt = page.inner_text("body")
                     if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
-                        raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta o inválida.")
+                        raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta.")
                     codigo_generacion = _extract_uuid(body_txt)
                 except Exception as e:
                     if "Hacienda rechazó" in str(e): raise e
@@ -279,113 +280,16 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
 
             browser.close()
 
-            # Devolvemos el éxito inmediatamente. El Sello viene impreso en el PDF.
+            # Guardamos el éxito y terminamos en tiempo récord
             TAREAS[task_id] = {
                 "status": "completado",
                 "exito": True,
                 "sello_recepcion": "IMPRESO-EN-EL-PDF", 
                 "codigo_generacion": codigo_generacion,
                 "pdf_base64": pdf_base64,
-                "json_content": "{}" # Dejamos el JSON vacío por ahora como pediste
+                "json_content": "{}"
             }
 
-    except Exception as e:
-        TAREAS[task_id] = {"status": "error", "exito": False, "detail": str(e)}
-
-            # ==========================================================
-            # 9. Ir a Consultas y Descargar (Lógica idéntica a Streamlit)
-            # ==========================================================
-            from urllib.parse import urlparse
-            parsed = urlparse(page.url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
-            consulta_url = f"{base_url}/consultaDteEmitidos"
-
-            page.goto(consulta_url, wait_until="domcontentloaded")
-            time.sleep(1)
-
-            input_cod = page.locator("input[formcontrolname='codigoGeneracion'], input[placeholder*='0000'], input[placeholder*='AAAA']").first
-            input_cod.wait_for(state="visible", timeout=10000)
-            input_cod.fill(codigo_generacion)
-            
-            page.locator("button:has-text('Consultar')").first.click()
-            page.wait_for_selector("tbody tr", timeout=15000)
-            time.sleep(1.5)
-
-            # --- 9a. Descargar PDF ---
-            pdf_base64 = ""
-            try:
-                pages_antes = set(id(p) for p in context.pages)
-                page.locator("button[tooltip='Versión legible'], button:has(i.fa-print)").first.click(force=True)
-                time.sleep(3)
-
-                pdf_tab = None
-                for pg in context.pages:
-                    if id(pg) not in pages_antes:
-                        pdf_tab = pg
-                        break
-                if not pdf_tab:
-                    for pg in context.pages:
-                        if "data:application/pdf" in pg.url or "blob:" in pg.url:
-                            pdf_tab = pg
-                            break
-
-                if pdf_tab:
-                    pdf_url = pdf_tab.url
-                    if pdf_url.startswith("data:application/pdf;base64,"):
-                        pdf_base64 = pdf_url.split(",", 1)[1]
-                    elif "blob:" in pdf_url:
-                        pdf_bytes_js = pdf_tab.evaluate("""async () => {
-                            const r = await fetch(document.URL);
-                            const buf = await r.arrayBuffer();
-                            return Array.from(new Uint8Array(buf));
-                        }""")
-                        pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
-                    try: pdf_tab.close()
-                    except: pass
-            except: pass
-
-            # --- 9b. Descargar JSON ---
-            json_content = ""
-            sello_recepcion = "SELLO-NO-ENCONTRADO"
-            try:
-                with context.expect_download(timeout=20000) as dl_info:
-                    page.locator("button[tooltip='Descargar documento'], button:has(i.fas.fa-arrow-down), button:has(i.fa-arrow-down)").first.click(force=True)
-                
-                json_path = f"/tmp/{codigo_generacion}.json"
-                dl_info.value.save_as(json_path)
-                with open(json_path, "r", encoding="utf-8") as f:
-                    json_content = f.read()
-                
-                try: sello_recepcion = json.loads(json_content).get("selloRecibido", "SELLO-NO-ENCONTRADO")
-                except: pass
-            except: 
-                # Fallback de JSON si falla la descarga directa
-                try:
-                    pages_antes2 = set(id(p) for p in context.pages)
-                    page.locator("button[tooltip='Descargar documento'], button:has(i.fas.fa-arrow-down), button:has(i.fa-arrow-down)").first.click(force=True)
-                    time.sleep(2)
-                    for pg in context.pages:
-                        if id(pg) not in pages_antes2:
-                            json_txt = pg.inner_text("body")
-                            if json_txt.strip().startswith("{"):
-                                json_content = json_txt
-                                try: sello_recepcion = json.loads(json_content).get("selloRecibido", "SELLO-NO-ENCONTRADO")
-                                except: pass
-                            try: pg.close()
-                            except: pass
-                            break
-                except: pass
-
-            browser.close()
-
-            TAREAS[task_id] = {
-                "status": "completado",
-                "exito": True,
-                "sello_recepcion": sello_recepcion,
-                "codigo_generacion": codigo_generacion,
-                "pdf_base64": pdf_base64,
-                "json_content": json_content
-            }
     except Exception as e:
         TAREAS[task_id] = {"status": "error", "exito": False, "detail": str(e)}
 

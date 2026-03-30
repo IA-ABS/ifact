@@ -7,11 +7,12 @@ import json
 import base64
 
 app = FastAPI()
-
+# ====== 1. AGREGAR ESTO PARA MANTENER DESPIERTO AL ROBOT ======
 @app.get("/")
 @app.get("/ping")
 def ping():
-    return {"status": "ok", "mensaje": "El robot está despierto y listo."}
+    return {"status": "ok", "mensaje": "El robot está listo y veloz."}
+# ==============================================================
 
 class Receptor(BaseModel):
     numDocumento: str
@@ -102,6 +103,12 @@ def automatizar_hacienda(req: FacturaRequest):
                 accept_downloads=True
             )
             page = context.new_page()
+
+            # ====== 2. NUEVO: MODO ULTRA RÁPIDO ======
+            # Esto bloquea imágenes y videos del Ministerio de Hacienda. 
+            # El robot navegará casi el doble de rápido, evitando el error 524.
+            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media"] else route.continue_())
+            # =========================================
 
             # 1. Login
             page.goto("https://factura.gob.sv/", wait_until="domcontentloaded")

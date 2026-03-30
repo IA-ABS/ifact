@@ -228,7 +228,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             except: pass
 
             # ==========================================================
-            # 8. ATRAPAR EL PDF AUTOMÁTICO Y EL UUID (SÚPER RÁPIDO)
+            # 8. ATRAPAR EL PDF AUTOMÁTICO Y EL UUID
             # ==========================================================
             codigo_generacion = ""
             pdf_base64 = ""
@@ -237,10 +237,21 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
                 return m.group(0).upper() if m else ""
 
-            # Esperamos hasta 20 segundos a que Hacienda abra la pestaña nueva con el PDF
+            # CLAVE 1: Esperar el Modal de Éxito de Hacienda (Esto faltaba en mi código anterior y es como lo hace tu Streamlit)
+            try:
+                page.wait_for_selector(".swal2-popup, .swal2-content", timeout=20000)
+                time.sleep(1.5)
+                body_txt = page.inner_text("body")
+                if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
+                    raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta o inválida.")
+                codigo_generacion = _extract_uuid(body_txt)
+            except Exception as e:
+                if "Hacienda rechazó" in str(e): raise e
+
+            # CLAVE 2: Buscar pestaña de PDF generada automáticamente
             t0 = time.time()
             pdf_tab = None
-            while time.time() - t0 < 20:
+            while time.time() - t0 < 10:
                 for pg in context.pages:
                     if "pdf" in pg.url.lower() or "blob:" in pg.url.lower():
                         pdf_tab = pg
@@ -250,12 +261,10 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 time.sleep(1)
 
             if pdf_tab:
-                # 1. Sacamos el UUID de la URL de la nueva pestaña
-                codigo_generacion = _extract_uuid(pdf_tab.url)
                 if not codigo_generacion:
-                    codigo_generacion = _extract_uuid(pdf_tab.title())
-                
-                # 2. Descargamos el PDF a Base64
+                    codigo_generacion = _extract_uuid(pdf_tab.url)
+                    if not codigo_generacion:
+                        codigo_generacion = _extract_uuid(pdf_tab.title())
                 try:
                     pdf_bytes_js = pdf_tab.evaluate("""async () => {
                         const r = await fetch(document.URL);
@@ -265,22 +274,54 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
                 except: pass
 
-            # Si falla y no se abre pestaña, leemos el mensaje de la pantalla de Hacienda
-            if not codigo_generacion:
+            # Cerramos los modales
+            for btn_txt in ["OK", "Aceptar", "Cerrar"]:
                 try:
-                    body_txt = page.inner_text("body")
-                    if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
-                        raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta.")
-                    codigo_generacion = _extract_uuid(body_txt)
-                except Exception as e:
-                    if "Hacienda rechazó" in str(e): raise e
+                    page.locator(f"button:has-text('{btn_txt}')").last.click(force=True, timeout=1000)
+                    time.sleep(0.3)
+                except: pass
 
             if not codigo_generacion:
                 raise Exception("El portal de Hacienda no devolvió el UUID. Verifica tu Clave Privada.")
 
+            # CLAVE 3: RED DE SEGURIDAD (FALLBACK A CONSULTAS)
+            # Solo si el servidor de Render bloqueó la pestaña emergente, vamos a Consultas para salvar el PDF.
+            if not pdf_base64:
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(page.url)
+                    base_url = f"{parsed.scheme}://{parsed.netloc}"
+                    page.goto(f"{base_url}/consultaDteEmitidos", wait_until="domcontentloaded")
+                    time.sleep(1)
+
+                    input_cod = page.locator("input[formcontrolname='codigoGeneracion'], input[placeholder*='0000']").first
+                    input_cod.wait_for(state="visible", timeout=10000)
+                    input_cod.fill(codigo_generacion)
+                    
+                    page.locator("button:has-text('Consultar')").first.click()
+                    page.wait_for_selector("tbody tr", timeout=15000)
+                    time.sleep(1.5)
+
+                    pages_antes = set(id(p) for p in context.pages)
+                    page.locator("button[tooltip='Versión legible'], button:has(i.fa-print)").first.click(force=True)
+                    time.sleep(3)
+
+                    for pg in context.pages:
+                        if id(pg) not in pages_antes or "pdf" in pg.url.lower() or "blob:" in pg.url.lower():
+                            try:
+                                pdf_bytes_js = pg.evaluate("""async () => {
+                                    const r = await fetch(document.URL);
+                                    const buf = await r.arrayBuffer();
+                                    return Array.from(new Uint8Array(buf));
+                                }""")
+                                pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
+                            except: pass
+                            break
+                except: pass
+
             browser.close()
 
-            # Guardamos el éxito y terminamos en tiempo récord
+            # Guardamos el éxito y terminamos
             TAREAS[task_id] = {
                 "status": "completado",
                 "exito": True,

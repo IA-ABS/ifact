@@ -221,77 +221,145 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 page.locator("button:has-text('OK')").last.click(force=True)
             except: pass
 
-            # 8. Extraer UUID y Leer Respuestas de Hacienda
+            # ==========================================================
+            # 8. Capturar código de generación (Lógica idéntica a Streamlit)
+            # ==========================================================
             codigo_generacion = ""
             def _extract_uuid(text):
                 m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
                 return m.group(0).upper() if m else ""
 
-            # Esperar hasta 15 segundos a que aparezca el popup (SweetAlert) de Hacienda
             try:
-                page.wait_for_selector(".swal2-popup", timeout=15000)
-                swal_text = page.locator(".swal2-popup").inner_text()
-                codigo_generacion = _extract_uuid(swal_text)
+                page.wait_for_selector(".swal2-popup, .swal2-content", timeout=20000)
+                time.sleep(1.5)
                 
-                # Si salió un popup pero NO tiene un UUID, es un mensaje de error de Hacienda
-                if not codigo_generacion:
-                    error_msg = swal_text.replace('\n', ' ').strip()
-                    # Si dice "OK", lo limpiamos para que el mensaje sea más claro
-                    if error_msg.endswith("OK"): error_msg = error_msg[:-2].strip()
-                    raise Exception(f"Rechazado por Hacienda: {error_msg}")
+                # Leemos todo el cuerpo de la página
+                body_txt = page.inner_text("body")
+                
+                # Si el popup dice "incorrecta", lanzamos el error legible
+                if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
+                    swal_text = page.locator(".swal2-popup").inner_text()
+                    raise Exception(f"Rechazo de Hacienda: {swal_text.strip()}")
+
+                codigo_generacion = _extract_uuid(body_txt)
             except Exception as e:
-                if "Rechazado por Hacienda" in str(e):
-                    raise e # Lanzar el error exacto hacia el frontend
+                if "Rechazo de Hacienda" in str(e):
+                    raise e
                 pass
 
-            # Fallback 1: Buscar en todo el body por si no usó SweetAlert
+            # Fallback: Buscar en las pestañas nuevas (Igual que Streamlit)
             if not codigo_generacion:
                 try:
-                    time.sleep(2)
-                    codigo_generacion = _extract_uuid(page.inner_text("body"))
+                    t0 = time.time()
+                    pdf_page = None
+                    while time.time() - t0 < 15:
+                        for pg in context.pages:
+                            if "data:application/pdf" in pg.url or "blob:" in pg.url:
+                                pdf_page = pg
+                                break
+                        if pdf_page:
+                            break
+                        time.sleep(0.5)
+                    if pdf_page:
+                        codigo_generacion = _extract_uuid(pdf_page.url)
+                        if not codigo_generacion:
+                            try:
+                                codigo_generacion = _extract_uuid(pdf_page.title())
+                            except: pass
                 except: pass
 
-            # Fallback 2: Buscar en las pestañas nuevas (Si abrió el PDF automáticamente)
+            for btn_txt in ["OK", "Aceptar", "Cerrar"]:
+                try: 
+                    page.locator(f"button:has-text('{btn_txt}')").last.click(force=True, timeout=2000)
+                    time.sleep(0.5)
+                except: pass
+
             if not codigo_generacion:
-                for pg in context.pages:
-                    if "pdf" in pg.url or "blob" in pg.url:
-                        codigo_generacion = _extract_uuid(pg.url)
-                        if codigo_generacion: break
+                raise Exception("El portal de Hacienda no devolvió el UUID. Verifica tu Clave Privada.")
 
-            if not codigo_generacion: 
-                raise Exception("El portal de Hacienda no devolvió el UUID. Verifica que tu Clave Privada sea correcta y que la página del MH no esté caída en este momento.")
+            # ==========================================================
+            # 9. Ir a Consultas y Descargar (Lógica idéntica a Streamlit)
+            # ==========================================================
+            from urllib.parse import urlparse
+            parsed = urlparse(page.url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            consulta_url = f"{base_url}/consultaDteEmitidos"
 
-            # 9. Consultar
-            page.goto("https://factura.gob.sv/consultaDteEmitidos", wait_until="domcontentloaded")
+            page.goto(consulta_url, wait_until="domcontentloaded")
             time.sleep(1)
-            page.locator("input[formcontrolname='codigoGeneracion']").first.fill(codigo_generacion)
+
+            input_cod = page.locator("input[formcontrolname='codigoGeneracion'], input[placeholder*='0000'], input[placeholder*='AAAA']").first
+            input_cod.wait_for(state="visible", timeout=10000)
+            input_cod.fill(codigo_generacion)
+            
             page.locator("button:has-text('Consultar')").first.click()
-            time.sleep(2)
+            page.wait_for_selector("tbody tr", timeout=15000)
+            time.sleep(1.5)
 
-            # JSON
-            json_content = ""
-            sello_recepcion = "SELLO-NO-ENCONTRADO"
-            try:
-                with context.expect_download(timeout=15000) as dl_info:
-                    page.locator("button[tooltip='Descargar documento']").first.click(force=True)
-                json_path = f"/tmp/{codigo_generacion}.json"
-                dl_info.value.save_as(json_path)
-                with open(json_path, "r", encoding="utf-8") as f: json_content = f.read()
-                sello_recepcion = json.loads(json_content).get("selloRecibido", sello_recepcion)
-            except: pass
-
-            # PDF
+            # --- 9a. Descargar PDF ---
             pdf_base64 = ""
             try:
                 pages_antes = set(id(p) for p in context.pages)
-                page.locator("button[tooltip='Versión legible']").first.click(force=True)
+                page.locator("button[tooltip='Versión legible'], button:has(i.fa-print)").first.click(force=True)
                 time.sleep(3)
+
+                pdf_tab = None
                 for pg in context.pages:
                     if id(pg) not in pages_antes:
-                        pdf_bytes_js = pg.evaluate("async () => { const r = await fetch(document.URL); const buf = await r.arrayBuffer(); return Array.from(new Uint8Array(buf)); }")
-                        pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
+                        pdf_tab = pg
                         break
+                if not pdf_tab:
+                    for pg in context.pages:
+                        if "data:application/pdf" in pg.url or "blob:" in pg.url:
+                            pdf_tab = pg
+                            break
+
+                if pdf_tab:
+                    pdf_url = pdf_tab.url
+                    if pdf_url.startswith("data:application/pdf;base64,"):
+                        pdf_base64 = pdf_url.split(",", 1)[1]
+                    elif "blob:" in pdf_url:
+                        pdf_bytes_js = pdf_tab.evaluate("""async () => {
+                            const r = await fetch(document.URL);
+                            const buf = await r.arrayBuffer();
+                            return Array.from(new Uint8Array(buf));
+                        }""")
+                        pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
+                    try: pdf_tab.close()
+                    except: pass
             except: pass
+
+            # --- 9b. Descargar JSON ---
+            json_content = ""
+            sello_recepcion = "SELLO-NO-ENCONTRADO"
+            try:
+                with context.expect_download(timeout=20000) as dl_info:
+                    page.locator("button[tooltip='Descargar documento'], button:has(i.fas.fa-arrow-down), button:has(i.fa-arrow-down)").first.click(force=True)
+                
+                json_path = f"/tmp/{codigo_generacion}.json"
+                dl_info.value.save_as(json_path)
+                with open(json_path, "r", encoding="utf-8") as f:
+                    json_content = f.read()
+                
+                try: sello_recepcion = json.loads(json_content).get("selloRecibido", "SELLO-NO-ENCONTRADO")
+                except: pass
+            except: 
+                # Fallback de JSON si falla la descarga directa
+                try:
+                    pages_antes2 = set(id(p) for p in context.pages)
+                    page.locator("button[tooltip='Descargar documento'], button:has(i.fas.fa-arrow-down), button:has(i.fa-arrow-down)").first.click(force=True)
+                    time.sleep(2)
+                    for pg in context.pages:
+                        if id(pg) not in pages_antes2:
+                            json_txt = pg.inner_text("body")
+                            if json_txt.strip().startswith("{"):
+                                json_content = json_txt
+                                try: sello_recepcion = json.loads(json_content).get("selloRecibido", "SELLO-NO-ENCONTRADO")
+                                except: pass
+                            try: pg.close()
+                            except: pass
+                            break
+                except: pass
 
             browser.close()
 

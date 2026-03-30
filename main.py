@@ -291,7 +291,19 @@ def automatizar_hacienda(req: FacturaRequest):
                     bp.scroll_into_view_if_needed()
                     bp.click(force=True)
                     time.sleep(1)
-                except: pass
+                except:
+                    try:
+                        page.evaluate("""
+                            const b = Array.from(document.querySelectorAll('button.btn-primary'))
+                                       .find(x => x.querySelector('i.fa-plus'));
+                            if (b) { b.scrollIntoView(); b.click(); }
+                            else {
+                                const bb = document.querySelector('button.btn-block');
+                                if (bb) { bb.scrollIntoView(); bb.click(); }
+                            }
+                        """)
+                        time.sleep(1)
+                    except: pass
             else:
                 try:
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -339,19 +351,44 @@ def automatizar_hacienda(req: FacturaRequest):
             except: pass
 
             # =================================================================
-            # 8. EXTRACCIÓN REAL DEL UUID Y DESCARGA DE ARCHIVOS
+            # 8. EXTRACCIÓN REAL DEL UUID (RESTAURADO DE TU STREAMLIT)
             # =================================================================
             codigo_generacion = ""
+            
+            def _extract_uuid(text):
+                m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
+                return m.group(0).upper() if m else ""
+
+            # Intento 1: Buscar en el modal de éxito
             try:
-                page.wait_for_selector(".swal2-popup, .swal2-content", timeout=20000)
-                time.sleep(1.5)
+                time.sleep(3) # Dar tiempo a que el servidor de MH responda
+                page.wait_for_selector(".swal2-popup, .swal2-content", timeout=15000)
                 body_text = page.inner_text("body")
-                m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", body_text)
-                if m: codigo_generacion = m.group(0).upper()
+                codigo_generacion = _extract_uuid(body_text)
             except: pass
 
+            # Intento 2: Buscar en las pestañas nuevas (PDF blob) EXACTAMENTE como en Streamlit
             if not codigo_generacion:
-                raise Exception("No se pudo capturar el Código de Generación (UUID) tras firmar.")
+                try:
+                    t0 = time.time()
+                    pdf_page = None
+                    while time.time() - t0 < 15:
+                        for pg in context.pages:
+                            if "data:application/pdf" in pg.url or "blob:" in pg.url:
+                                pdf_page = pg
+                                break
+                        if pdf_page:
+                            break
+                        time.sleep(0.5)
+                    
+                    if pdf_page:
+                        codigo_generacion = _extract_uuid(pdf_page.url)
+                        if not codigo_generacion:
+                            codigo_generacion = _extract_uuid(pdf_page.title())
+                except: pass
+
+            if not codigo_generacion:
+                raise Exception("No se pudo capturar el Código de Generación (UUID) tras firmar. El portal no lo mostró a tiempo.")
 
             # Cerrar modales
             for btn_txt in ["OK", "Aceptar", "Cerrar"]:

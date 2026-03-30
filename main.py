@@ -57,6 +57,7 @@ def fill_field(page, selector, value, timeout=5000):
         el = page.locator(selector).first
         el.wait_for(state="visible", timeout=timeout)
         el.fill(str(value))
+        el.press("Tab") # Crucial para que Angular registre el cambio
     except: pass
 
 def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
@@ -130,20 +131,42 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
 
             if ("Crédito Fiscal" in tipo_dte) or es_nota:
                 if req.receptor.nrc: fill_field(page, "input[formcontrolname='nrc']", req.receptor.nrc.replace("-", ""))
+                
+                # ==========================================================
+                # FIX 1: SOLUCIÓN AL SELECTOR DE "ACTIVIDAD ECONÓMICA"
+                # ==========================================================
                 if req.receptor.codActividad:
                     try:
                         cod = req.receptor.codActividad.split(" - ")[0].strip()
                         a = page.locator("ng-select[formcontrolname='actividadEconomica']").first
-                        a.click(); a.locator("input").fill(cod)
-                        page.locator(f"div.ng-option:has-text('{cod}')").first.click()
+                        a.wait_for(state="visible", timeout=5000)
+                        a.click(force=True) # Clic forzado
+                        time.sleep(0.5)
+                        a_input = a.locator("input[type='text']").first
+                        a_input.fill(cod)
+                        time.sleep(1) # Darle 1 seg a Angular para buscar
+                        opt = page.locator(f"div.ng-option:has-text('{cod}')").first
+                        opt.wait_for(state="visible", timeout=5000)
+                        opt.click(force=True)
+                        time.sleep(0.5)
                     except: pass
 
             fill_field(page, "input[formcontrolname='nombre']", req.receptor.nombre)
-            fill_field(page, "textarea[formcontrolname='complemento']", req.receptor.direccion)
+            
+            # ==========================================================
+            # FIX 2: SOLUCIÓN A "DIRECCIÓN REQUERIDA" 
+            # ==========================================================
+            # Hacienda NO permite que la dirección vaya vacía
+            dir_val = req.receptor.direccion.strip()
+            if not dir_val: dir_val = "San Salvador, El Salvador" # Si va vacío, ponemos un comodín
+            try:
+                comp = page.locator("textarea[formcontrolname='complemento']").first
+                comp.wait_for(state="visible", timeout=5000)
+                comp.clear()
+                comp.fill(dir_val)
+                comp.press("Tab") # Disparar evento de Angular
+            except: pass
 
-            # ==========================================================
-            # SECCIÓN CORREGIDA: LLENADO DEL MODAL AZUL DE ÍTEMS
-            # ==========================================================
             reportar_paso(task_id, "Abriendo panel de productos...", page)
             for i, item in enumerate(req.items):
                 if i == 0:
@@ -156,67 +179,48 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     except: pass
                 
                 reportar_paso(task_id, f"Llenando datos del producto {i+1}...", page)
-                
-                # 1. Tipo
                 try: page.locator("select[formcontrolname='tipo']").first.select_option(label=TIPO_ITEM_MAP.get(item.tipo_item, "1 - Bien"))
                 except: pass
                 
-                # 2. Cantidad
                 try:
                     ci = page.locator("input[formcontrolname='cantidad']").first
                     ci.clear(); ci.fill(str(item.cantidad)); ci.press("Tab")
                 except: pass
                 
-                # 3. Unidad
                 try: page.locator("select[formcontrolname='unidad']").first.select_option(label="Unidad")
                 except: pass
                 
-                # 4. Descripción del Producto (CORREGIDO: formcontrolname='producto')
                 try:
                     desc_input = page.locator("input[formcontrolname='producto'], input[formcontrolname='descripcion'], input[placeholder='Nombre Producto']").first
                     desc_input.clear(); desc_input.fill(item.descripcion)
                 except: pass
                 
-                # 5. Tipo Venta
                 try: page.locator("select[formcontrolname='tipoVenta']").first.select_option(label=item.tipo_venta)
                 except: pass
                 
-                # 6. Precio (CORREGIDO: formcontrolname='precio')
                 try:
                     pi = page.locator("input[formcontrolname='precio'], input[formcontrolname='precioUnitario']").first
                     pi.clear(); pi.fill(f"{item.precio:.2f}"); pi.press("Tab")
-                    time.sleep(0.5) # Esperar a que se calcule el Total abajo
+                    time.sleep(0.5)
                 except: pass
                 
                 reportar_paso(task_id, f"Guardando producto {i+1}...", page)
-                
-                # 7. Clic en "Agregar ítem"
                 try: 
-                    # Selector infalible basado en tu HTML
                     btn_add = page.locator("button[ngbpopover='Adicionar al documento.'], button.btn-primary:has-text('Agregar ítem'), button.btn-primary:has-text('Agregar Ítem')").first
                     btn_add.click(force=True)
                     time.sleep(1.5)
                 except: pass
                 
-                # 8. Manejar el popup verde de éxito
                 try:
-                    if i < len(req.items) - 1:
-                        page.locator("button:has-text('Seguir adicionando')").first.click(force=True)
-                    else:
-                        page.locator("button:has-text('Regresar al documento'), button.swal2-confirm:has-text('OK')").first.click(force=True)
+                    if i < len(req.items) - 1: page.locator("button:has-text('Seguir adicionando')").first.click(force=True)
+                    else: page.locator("button:has-text('Regresar al documento'), button.swal2-confirm:has-text('OK')").first.click(force=True)
                 except: pass
-                
                 time.sleep(1)
 
-                # 9. RED DE SEGURIDAD: Si el modal azul sigue abierto tapando todo, forzamos el cierre
                 try:
                     btn_cancelar = page.locator("button[data-dismiss='modal']:has-text('Cancelar')").first
-                    if btn_cancelar.is_visible():
-                        btn_cancelar.click(force=True)
-                        time.sleep(0.5)
+                    if btn_cancelar.is_visible(): btn_cancelar.click(force=True); time.sleep(0.5)
                 except: pass
-            
-            # ==========================================================
 
             if not es_nota:
                 reportar_paso(task_id, "Configurando Forma de Pago...", page)
@@ -228,11 +232,15 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 try:
                     mp = page.locator("input[formcontrolname='montoPago']").first
                     mp.clear(); mp.fill(f"{monto_pago:.2f}"); mp.press("Tab")
+                    time.sleep(0.5)
                 except: pass
                 
-                # CORREGIDO: Selector exacto para el botón +
+                # ==========================================================
+                # FIX 3: CLIC CORRECTO EN BOTÓN "+" DE FORMA PAGO
+                # ==========================================================
                 try: 
                     btn_plus = page.locator("button[tooltip='Agregar forma de pago'], button.btn-block:has(i.fa-plus)").first
+                    btn_plus.wait_for(state="visible", timeout=5000)
                     btn_plus.click(force=True)
                     time.sleep(1)
                 except: pass
@@ -241,26 +249,37 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(0.5)
             
-            # CORREGIDO: Selector exacto de Generar Documento
             try: 
                 btn_gen = page.locator("input[value='Generar Documento'], button:has-text('Generar Documento')").first
                 btn_gen.click(force=True)
                 time.sleep(1)
             except: pass
             
-            # CORREGIDO: Selector exacto SweetAlert de confirmación
+            # ==========================================================
+            # FIX 4: DETECTOR DE ERRORES ROSADOS (Validaciones)
+            # ==========================================================
+            # Si el modal de confirmación no aparece, escaneamos los errores rosados.
             try: 
                 btn_confirm = page.locator("button.swal2-confirm:has-text('Si, crear documento')").first
                 btn_confirm.wait_for(state="visible", timeout=5000)
                 btn_confirm.click(force=True)
-            except: pass
+            except: 
+                # Buscar cajas rosadas
+                errs = page.locator("div[style*='background-color: #f8d7da'], div.alert-danger").all_inner_texts()
+                if errs:
+                    err_msg = " | ".join([e.replace('×', '').replace('\n', ' ').strip() for e in errs])
+                    raise Exception(f"Faltan datos requeridos: {err_msg}")
             
             reportar_paso(task_id, "Ingresando Clave Privada...", page)
             try:
                 ic = page.get_by_placeholder("Ingrese la clave privada de validación")
                 ic.wait_for(state="visible", timeout=12000)
                 ic.fill(hw_clave)
-                bok = page.locator("button.swal2-confirm:has-text('OK')").last
+                
+                # ==========================================================
+                # FIX 5: CLIC EN "OK" MODAL DE LA CLAVE PRIVADA
+                # ==========================================================
+                bok = page.locator("button.swal2-confirm:has-text('OK'), button.swal2-confirm:visible").last
                 bok.wait_for(state="visible", timeout=5000)
                 bok.click(force=True)
             except: pass
@@ -281,7 +300,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta o inválida.")
                 codigo_generacion = _extract_uuid(body_txt)
             except Exception as e:
-                if "Hacienda rechazó" in str(e): raise e
+                if "Hacienda rechazó" in str(e) or "Faltan datos" in str(e): raise e
 
             t0 = time.time()
             pdf_tab = None

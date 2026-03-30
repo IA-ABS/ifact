@@ -221,30 +221,45 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 page.locator("button:has-text('OK')").last.click(force=True)
             except: pass
 
-            # 8. Extraer UUID
+            # 8. Extraer UUID y Leer Respuestas de Hacienda
             codigo_generacion = ""
             def _extract_uuid(text):
                 m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
                 return m.group(0).upper() if m else ""
 
+            # Esperar hasta 15 segundos a que aparezca el popup (SweetAlert) de Hacienda
             try:
-                time.sleep(3)
-                body_text = page.inner_text("body", timeout=15000)
-                codigo_generacion = _extract_uuid(body_text)
-            except: pass
+                page.wait_for_selector(".swal2-popup", timeout=15000)
+                swal_text = page.locator(".swal2-popup").inner_text()
+                codigo_generacion = _extract_uuid(swal_text)
+                
+                # Si salió un popup pero NO tiene un UUID, es un mensaje de error de Hacienda
+                if not codigo_generacion:
+                    error_msg = swal_text.replace('\n', ' ').strip()
+                    # Si dice "OK", lo limpiamos para que el mensaje sea más claro
+                    if error_msg.endswith("OK"): error_msg = error_msg[:-2].strip()
+                    raise Exception(f"Rechazado por Hacienda: {error_msg}")
+            except Exception as e:
+                if "Rechazado por Hacienda" in str(e):
+                    raise e # Lanzar el error exacto hacia el frontend
+                pass
 
+            # Fallback 1: Buscar en todo el body por si no usó SweetAlert
+            if not codigo_generacion:
+                try:
+                    time.sleep(2)
+                    codigo_generacion = _extract_uuid(page.inner_text("body"))
+                except: pass
+
+            # Fallback 2: Buscar en las pestañas nuevas (Si abrió el PDF automáticamente)
             if not codigo_generacion:
                 for pg in context.pages:
                     if "pdf" in pg.url or "blob" in pg.url:
                         codigo_generacion = _extract_uuid(pg.url)
-                        break
+                        if codigo_generacion: break
 
-            if not codigo_generacion: raise Exception("No se capturó el UUID.")
-
-            # Cerrar modales
-            for btn_txt in ["OK", "Aceptar", "Cerrar"]:
-                try: page.locator(f"button:has-text('{btn_txt}')").last.click(force=True, timeout=1000)
-                except: pass
+            if not codigo_generacion: 
+                raise Exception("El portal de Hacienda no devolvió el UUID. Verifica que tu Clave Privada sea correcta y que la página del MH no esté caída en este momento.")
 
             # 9. Consultar
             page.goto("https://factura.gob.sv/consultaDteEmitidos", wait_until="domcontentloaded")

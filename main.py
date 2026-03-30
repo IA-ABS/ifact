@@ -217,65 +217,80 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             try: page.locator("button.swal2-confirm:has-text('Si, crear documento')").first.click(force=True)
             except: pass
             try:
-                page.get_by_placeholder("Ingrese la clave privada de validación").fill(hw_clave)
-                page.locator("button:has-text('OK')").last.click(force=True)
+                ic = page.get_by_placeholder("Ingrese la clave privada de validación")
+                ic.wait_for(state="visible", timeout=12000)
+                ic.fill(hw_clave)
+                bok = page.locator("button:has-text('OK')").last
+                bok.wait_for(state="visible", timeout=5000)
+                bok.click(force=True)
             except: pass
 
             # ==========================================================
-            # 8. Capturar código de generación (Lógica idéntica a Streamlit)
+            # 8. ATRAPAR EL PDF AUTOMÁTICO Y EL UUID
             # ==========================================================
             codigo_generacion = ""
+            pdf_base64 = ""
+            
             def _extract_uuid(text):
                 m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
                 return m.group(0).upper() if m else ""
 
-            try:
-                page.wait_for_selector(".swal2-popup, .swal2-content", timeout=20000)
-                time.sleep(1.5)
-                
-                # Leemos todo el cuerpo de la página
-                body_txt = page.inner_text("body")
-                
-                # Si el popup dice "incorrecta", lanzamos el error legible
-                if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
-                    swal_text = page.locator(".swal2-popup").inner_text()
-                    raise Exception(f"Rechazo de Hacienda: {swal_text.strip()}")
+            # Esperamos hasta 20 segundos a que Hacienda genere y abra la nueva pestaña con el PDF
+            t0 = time.time()
+            pdf_tab = None
+            while time.time() - t0 < 20:
+                for pg in context.pages:
+                    # Buscamos la pestaña que tiene el PDF o el blob
+                    if "pdf" in pg.url.lower() or "blob:" in pg.url.lower():
+                        pdf_tab = pg
+                        break
+                if pdf_tab:
+                    break
+                time.sleep(1)
 
-                codigo_generacion = _extract_uuid(body_txt)
-            except Exception as e:
-                if "Rechazo de Hacienda" in str(e):
-                    raise e
-                pass
+            if pdf_tab:
+                # 1. Sacamos el UUID de la URL del PDF
+                codigo_generacion = _extract_uuid(pdf_tab.url)
+                if not codigo_generacion:
+                    codigo_generacion = _extract_uuid(pdf_tab.title())
+                
+                # 2. Convertimos ese PDF a Base64 para enviarlo al Frontend
+                try:
+                    pdf_bytes_js = pdf_tab.evaluate("""async () => {
+                        const r = await fetch(document.URL);
+                        const buf = await r.arrayBuffer();
+                        return Array.from(new Uint8Array(buf));
+                    }""")
+                    pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
+                except: pass
 
-            # Fallback: Buscar en las pestañas nuevas (Igual que Streamlit)
+            # Si por alguna razón la pestaña no se abrió, leemos el error de la pantalla principal
             if not codigo_generacion:
                 try:
-                    t0 = time.time()
-                    pdf_page = None
-                    while time.time() - t0 < 15:
-                        for pg in context.pages:
-                            if "data:application/pdf" in pg.url or "blob:" in pg.url:
-                                pdf_page = pg
-                                break
-                        if pdf_page:
-                            break
-                        time.sleep(0.5)
-                    if pdf_page:
-                        codigo_generacion = _extract_uuid(pdf_page.url)
-                        if not codigo_generacion:
-                            try:
-                                codigo_generacion = _extract_uuid(pdf_page.title())
-                            except: pass
-                except: pass
-
-            for btn_txt in ["OK", "Aceptar", "Cerrar"]:
-                try: 
-                    page.locator(f"button:has-text('{btn_txt}')").last.click(force=True, timeout=2000)
-                    time.sleep(0.5)
-                except: pass
+                    body_txt = page.inner_text("body")
+                    if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower() or "rechazado" in body_txt.lower():
+                        raise Exception("Hacienda rechazó la emisión. Clave privada incorrecta o inválida.")
+                    codigo_generacion = _extract_uuid(body_txt)
+                except Exception as e:
+                    if "Hacienda rechazó" in str(e): raise e
 
             if not codigo_generacion:
                 raise Exception("El portal de Hacienda no devolvió el UUID. Verifica tu Clave Privada.")
+
+            browser.close()
+
+            # Devolvemos el éxito inmediatamente. El Sello viene impreso en el PDF.
+            TAREAS[task_id] = {
+                "status": "completado",
+                "exito": True,
+                "sello_recepcion": "IMPRESO-EN-EL-PDF", 
+                "codigo_generacion": codigo_generacion,
+                "pdf_base64": pdf_base64,
+                "json_content": "{}" # Dejamos el JSON vacío por ahora como pediste
+            }
+
+    except Exception as e:
+        TAREAS[task_id] = {"status": "error", "exito": False, "detail": str(e)}
 
             # ==========================================================
             # 9. Ir a Consultas y Descargar (Lógica idéntica a Streamlit)

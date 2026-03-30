@@ -1,5 +1,5 @@
-# Usamos la imagen oficial de Microsoft que YA TRAE Chrome y las dependencias instaladas
-FROM mcr.microsoft.com/playwright/python:v1.42.0-jammy
+# Actualizado a la versión 1.58.0 que exige Playwright
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
 # Directorio de trabajo
 WORKDIR /app

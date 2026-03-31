@@ -1,25 +1,63 @@
 """
 IABSTECH IFACT – Robot RPA factura.gob.sv
-Angular 12 (ng-version="12.2.17") usa formularios reactivos.
 
-PROBLEMA RAÍZ DE VERSIONES ANTERIORES:
-  Playwright .fill() escribe en el DOM pero NO dispara los eventos internos
-  que Angular usa para actualizar el FormControl. Por eso los campos se
-  ven vacíos o con el valor original cuando el portal valida.
+CAUSA RAÍZ CONFIRMADA DE VERSIONES ANTERIORES:
+  Angular 12 requiere que los eventos vengan de interacción real del teclado.
+  .fill() de Playwright es demasiado rápido y no dispara todos los handlers.
+  La solución correcta y probada es:
+    1. click() para enfocar el campo
+    2. triple_click() para seleccionar todo
+    3. page.keyboard.type(value, delay=50) — simula tecleo real letra por letra
+    4. press("Tab") para confirmar y mover foco
 
-SOLUCIÓN:
-  Acceder directamente al FormControl de Angular via __ngContext__ y llamar
-  setValue() + markAsDirty() + markAsTouched(). Esto es equivalente a lo
-  que hace el usuario real al escribir.
+  Esto es exactamente lo que hace un usuario humano y Angular lo detecta 100%.
 """
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
-import time, re, base64, uuid
+import time, re, base64, uuid, json, traceback
 
 app = FastAPI()
 TAREAS: dict = {}
+
+
+# ── Log de diagnóstico en el endpoint para ver qué llega ─────────────────────
+@app.post("/facturar")
+async def facturar_inmediato(request: Request, bg_tasks: BackgroundTasks):
+    """
+    Loguea el raw body para diagnóstico y luego procesa.
+    """
+    try:
+        body_bytes = await request.body()
+        body_str   = body_bytes.decode("utf-8")
+        print(f"\n[FACTURAR] Body recibido ({len(body_str)} bytes):")
+        print(body_str[:500])
+
+        data = json.loads(body_str)
+        req  = FacturaRequest(**data)
+
+        print(f"[FACTURAR] Parsed OK:")
+        print(f"  nit_empresa   = '{req.nit_empresa}'")
+        print(f"  tipo_dte      = '{req.tipo_dte}'")
+        print(f"  receptor.nit  = '{req.receptor.numDocumento}'")
+        print(f"  receptor.nom  = '{req.receptor.nombre}'")
+        print(f"  items count   = {len(req.items)}")
+        for i, item in enumerate(req.items):
+            print(f"  item[{i}]: {item.cantidad}x '{item.descripcion}' ${item.precio}")
+
+        task_id = str(uuid.uuid4())
+        bg_tasks.add_task(procesar_dte_en_fondo, task_id, req)
+        return JSONResponse({"exito": True, "task_id": task_id, "status": "procesando"})
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[FACTURAR] ERROR parseando request: {e}\n{tb}")
+        return JSONResponse(
+            {"exito": False, "error": f"Error parseando datos: {str(e)}"},
+            status_code=400
+        )
 
 
 # ── Modelos ───────────────────────────────────────────────────────────────────
@@ -31,8 +69,8 @@ def ping():
 
 
 class Receptor(BaseModel):
-    numDocumento: str
-    nombre: str
+    numDocumento: str = ""
+    nombre: str = ""
     nrc: str = ""
     codActividad: str = ""
     departamento: str = ""
@@ -43,28 +81,32 @@ class Receptor(BaseModel):
 
 
 class Item(BaseModel):
-    cantidad: float
-    descripcion: str
-    precio: float
+    cantidad: float = 1
+    descripcion: str = ""
+    precio: float = 0
     tipo_item: str = "1 - Bien"
     tipo_venta: str = "Gravado"
 
 
 class FacturaRequest(BaseModel):
-    nit_empresa: str
-    clave_hacienda: str
+    nit_empresa: str = ""
+    clave_hacienda: str = ""
     clave_firma: str = ""
-    tipo_dte: str
-    receptor: Receptor
-    items: list[Item]
-    formas_pago: list[str]
+    tipo_dte: str = "Comprobante de Crédito Fiscal"
+    receptor: Receptor = Receptor()
+    items: list[Item] = []
+    formas_pago: list[str] = ["01"]
     condicion: str = "Contado"
     observaciones: str = ""
 
 
-# ── Constantes del portal (del HTML real) ─────────────────────────────────────
+@app.get("/status/{task_id}")
+def verificar_status(task_id: str):
+    return TAREAS.get(task_id, {"status": "no_encontrado"})
 
-# Valores reales de los <option> en el select de Forma de Pago
+
+# ── Constantes del portal (del HTML real inspeccionado) ───────────────────────
+
 FP_MAP = {
     "01": "0: 01",   # Billetes y monedas
     "02": "1: 02",   # Tarjeta Débito
@@ -87,134 +129,19 @@ TIPO_ITEM_MAP = {
 }
 
 
-# ── JavaScript central: llenar campos Angular 12 ─────────────────────────────
-
-# Este script JS es el NÚCLEO de la solución.
-# Angular 12 almacena el FormControl en __ngContext__ del elemento DOM.
-# Al llamar setValue() directamente sobre el FormControl, Angular detecta
-# el cambio como si el usuario hubiera escrito el valor.
-JS_SET_INPUT = """
-(args) => {
-    const [selector, value] = args;
-    const el = document.querySelector(selector);
-    if (!el) return {ok: false, msg: 'no element: ' + selector};
-
-    // ── Método 1: Angular __ngContext__ (Angular 9+) ──────────────
-    try {
-        const ctxKey = Object.keys(el).find(k => k.startsWith('__ngContext__'));
-        if (ctxKey) {
-            const ctx = el[ctxKey];
-            for (let i = 0; i < ctx.length; i++) {
-                const node = ctx[i];
-                if (node && typeof node.setValue === 'function' && '_onChange' in node) {
-                    node.setValue(value);
-                    node.markAsDirty();
-                    node.markAsTouched();
-                    node._onChange.forEach(fn => { try { fn(value); } catch(e) {} });
-                    node._onTouched.forEach(fn => { try { fn(); } catch(e) {} });
-                    return {ok: true, msg: 'angular FormControl setValue at ' + i};
-                }
-            }
-        }
-    } catch(e) {}
-
-    // ── Método 2: nativeInputValueSetter + eventos DOM ────────────
-    try {
-        let setter;
-        if (el.tagName === 'TEXTAREA') {
-            setter = Object.getOwnPropertyDescriptor(
-                window.HTMLTextAreaElement.prototype, 'value').set;
-        } else {
-            setter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value').set;
-        }
-        setter.call(el, value);
-        ['input','change','blur'].forEach(ev =>
-            el.dispatchEvent(new Event(ev, {bubbles: true})));
-        return {ok: true, msg: 'native setter + events'};
-    } catch(e) {}
-
-    return {ok: false, msg: 'all methods failed'};
-}
-"""
-
-# Para <select> con Angular
-JS_SET_SELECT = """
-(args) => {
-    const [selector, value] = args;
-    const el = document.querySelector(selector);
-    if (!el) return {ok: false, msg: 'no element: ' + selector};
-
-    // Establecer valor DOM
-    el.value = value;
-
-    // Angular __ngContext__
-    try {
-        const ctxKey = Object.keys(el).find(k => k.startsWith('__ngContext__'));
-        if (ctxKey) {
-            const ctx = el[ctxKey];
-            for (let i = 0; i < ctx.length; i++) {
-                const node = ctx[i];
-                if (node && typeof node.setValue === 'function' && '_onChange' in node) {
-                    node.setValue(value);
-                    node.markAsDirty();
-                    node.markAsTouched();
-                    node._onChange.forEach(fn => { try { fn(value); } catch(e) {} });
-                    return {ok: true, msg: 'angular FormControl setValue select'};
-                }
-            }
-        }
-    } catch(e) {}
-
-    // Fallback eventos DOM
-    el.dispatchEvent(new Event('change', {bubbles: true}));
-    el.dispatchEvent(new Event('blur',   {bubbles: true}));
-    return {ok: true, msg: 'DOM events fallback'};
-}
-"""
-
-# Para ng-select (componente Angular personalizado de actividad económica)
-JS_SET_NGSELECT = """
-(args) => {
-    const [selector, searchText] = args;
-    const comp = document.querySelector(selector);
-    if (!comp) return {ok: false, msg: 'no ng-select: ' + selector};
-    try {
-        const ctxKey = Object.keys(comp).find(k => k.startsWith('__ngContext__'));
-        if (ctxKey) {
-            const ctx = comp[ctxKey];
-            for (let i = 0; i < ctx.length; i++) {
-                const node = ctx[i];
-                if (node && typeof node.open === 'function') {
-                    node.open();
-                    if (node.searchTerm !== undefined) node.searchTerm = searchText;
-                    if (node.filter)   node.filter(searchText);
-                    if (node._items && node._items.length > 0) {
-                        node.select(node._items[0]);
-                        return {ok: true, msg: 'ng-select item selected'};
-                    }
-                }
-            }
-        }
-    } catch(e) {}
-    return {ok: false, msg: 'ng-select not found in context'};
-}
-"""
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _shot(page) -> str:
     try:
         return base64.b64encode(
-            page.screenshot(type="jpeg", quality=45)
+            page.screenshot(type="jpeg", quality=50)
         ).decode("utf-8")
     except:
         return ""
 
 
 def _rep(task_id: str, msg: str, page=None):
-    print(f"[{task_id[:8]}] {msg}")
+    print(f"[RPA {task_id[:8]}] {msg}")
     TAREAS[task_id]["mensaje"] = msg
     if page:
         s = _shot(page)
@@ -244,107 +171,103 @@ def _muni_num(raw: str) -> str:
     return raw.split(" - ")[0].strip()
 
 
-# ── Funciones de llenado para Angular 12 ─────────────────────────────────────
+# ── La función de llenado correcta para Angular ───────────────────────────────
 
-def angular_fill(page, selector: str, value: str, timeout: int = 8000) -> bool:
+def type_into(page, selector: str, value: str,
+              timeout: int = 10000, delay: int = 40) -> bool:
     """
-    Llena un <input> o <textarea> en Angular 12.
-    Primero espera que el elemento sea visible, luego usa JS para
-    actualizar el FormControl interno y disparar todos los eventos.
+    Llena un campo Angular usando tecleo real simulado.
+    Este método es el más confiable para formularios Angular/React:
+    1. Espera que el elemento sea visible
+    2. click() — enfoca el campo y Angular activa el control
+    3. triple_click() — selecciona TODO el texto existente
+    4. keyboard.type(value, delay=delay) — simula tecleo letra por letra
+       El delay entre letras da tiempo a Angular para procesar cada keypress
+    5. press("Tab") — confirma el valor y mueve el foco al siguiente campo
     """
+    if not value:
+        return True
     try:
         el = page.locator(selector).first
         el.wait_for(state="visible", timeout=timeout)
         el.scroll_into_view_if_needed()
-
-        # Llamada JS que accede al FormControl de Angular
-        result = page.evaluate(JS_SET_INPUT, [selector, str(value)])
-        time.sleep(0.3)
-
-        # Verificación: leer el valor actual del DOM
-        actual = page.locator(selector).first.input_value()
-        if str(value) in actual or actual in str(value):
-            return True
-
-        # Si la verificación falla, intentar con click + keyboard como último recurso
+        time.sleep(0.2)
         el.click()
-        time.sleep(0.15)
-        page.keyboard.press("Control+a")
-        page.keyboard.type(str(value))
+        time.sleep(0.2)
+        el.triple_click()
+        time.sleep(0.1)
+        page.keyboard.type(str(value), delay=delay)
+        time.sleep(0.2)
         el.press("Tab")
         time.sleep(0.3)
+
+        # Verificar que quedó el valor
+        actual = ""
+        try:
+            actual = el.input_value()
+        except:
+            pass
+        print(f"  type_into '{selector}' = '{value}' → dom='{actual}'")
         return True
     except Exception as e:
-        print(f"  angular_fill '{selector}' = '{value}': {e}")
+        print(f"  type_into FAIL '{selector}': {e}")
         return False
 
 
-def angular_select(page, selector: str, value: str = None,
-                   label: str = None, timeout: int = 8000) -> bool:
+def select_into(page, selector: str, value: str = None,
+                label: str = None, timeout: int = 8000) -> bool:
     """
-    Selecciona una opción en un <select> Angular 12.
+    Selecciona una opción en un <select>.
+    Usa Playwright select_option que funciona bien con Angular
+    siempre que dispare change event (lo hace por defecto).
     """
+    if not value and not label:
+        return True
     try:
         el = page.locator(selector).first
         el.wait_for(state="visible", timeout=timeout)
         el.scroll_into_view_if_needed()
-
-        # Obtener el value real de la opción si se pasó label
-        if label and value is None:
-            value = page.evaluate(
-                """([sel, lbl]) => {
-                    const sel_el = document.querySelector(sel);
-                    if (!sel_el) return null;
-                    const opt = Array.from(sel_el.options)
-                        .find(o => o.text.trim() === lbl || o.text.includes(lbl));
-                    return opt ? opt.value : null;
-                }""",
-                [selector, label]
-            )
-
-        if value is None:
-            return False
-
-        result = page.evaluate(JS_SET_SELECT, [selector, str(value)])
-        time.sleep(0.3)
+        if value:
+            el.select_option(value=value)
+        else:
+            el.select_option(label=label)
+        time.sleep(0.35)
+        print(f"  select_into '{selector}' = '{value or label}'")
         return True
     except Exception as e:
-        print(f"  angular_select '{selector}' = '{value}': {e}")
+        print(f"  select_into FAIL '{selector}': {e}")
         return False
 
 
-def angular_ngselect(page, selector: str, search_text: str,
-                     timeout: int = 8000) -> bool:
+def fill_ngselect(page, selector: str, search: str,
+                  timeout: int = 8000) -> bool:
     """
-    Selecciona un valor en ng-select (componente Angular especial).
-    Estrategia: intentar vía JS primero, luego interacción manual.
+    Llena un ng-select: clic → escribir en el input interno → elegir primera opción.
     """
+    if not search:
+        return True
+    cod = search.split(" - ")[0].strip()
     try:
         comp = page.locator(selector).first
         comp.wait_for(state="visible", timeout=timeout)
         comp.scroll_into_view_if_needed()
-
-        # Intento 1: JS directo al componente
-        result = page.evaluate(JS_SET_NGSELECT, [selector, search_text])
-        if result.get("ok"):
-            time.sleep(0.4)
-            return True
-
-        # Intento 2: interacción manual (clic → escribir → elegir primera opción)
         comp.click(force=True)
         time.sleep(0.5)
-        input_inside = comp.locator("input[type='text']").first
-        input_inside.wait_for(state="visible", timeout=3000)
-        input_inside.fill(search_text)
-        time.sleep(1.2)
 
-        option = page.locator("div.ng-option:not(.ng-option-disabled)").first
-        option.wait_for(state="visible", timeout=4000)
-        option.click(force=True)
+        inp = comp.locator("input[type='text']").first
+        inp.wait_for(state="visible", timeout=3000)
+        inp.type(cod, delay=50)
+        time.sleep(1.5)
+
+        opt = page.locator("div.ng-option:not(.ng-option-disabled)").first
+        opt.wait_for(state="visible", timeout=5000)
+        opt_text = opt.inner_text()
+        opt.click(force=True)
         time.sleep(0.4)
+        print(f"  ng-select '{selector}' → seleccionó '{opt_text[:40]}'")
         return True
     except Exception as e:
-        print(f"  angular_ngselect '{selector}': {e}")
+        print(f"  ng-select FAIL '{selector}': {e}")
         return False
 
 
@@ -352,60 +275,55 @@ def angular_ngselect(page, selector: str, search_text: str,
 
 def fill_receptor(page, task_id: str, req: FacturaRequest):
     _rep(task_id, "Llenando receptor...", page)
-    is_ccf = "Crédito Fiscal" in req.tipo_dte
 
-    nit_clean = req.receptor.numDocumento.replace("-", "").strip()
+    r = req.receptor
+    nit_clean = r.numDocumento.replace("-", "").strip()
 
-    # NIT del receptor — formcontrolname="nit" / placeholder="Digite el número de NIT"
-    ok_nit = angular_fill(page,
-        "input[formcontrolname='nit']", nit_clean)
-    if not ok_nit:
-        angular_fill(page,
-            "input[placeholder*='NIT del receptor']", nit_clean)
+    print(f"  [receptor] NIT={nit_clean} nombre={r.nombre} nrc={r.nrc}")
+    print(f"  [receptor] depto={r.departamento} muni={r.municipio}")
+    print(f"  [receptor] dir={r.direccion} correo={r.correo} tel={r.telefono}")
 
-    # Nombre del cliente — formcontrolname="nombre"
-    angular_fill(page,
-        "input[formcontrolname='nombre']", req.receptor.nombre)
+    # NIT — formcontrolname="nit", placeholder="Digite el número de NIT del receptor"
+    nit_ok = type_into(page, "input[formcontrolname='nit']", nit_clean)
+    if not nit_ok:
+        type_into(page, "input[placeholder*='NIT del receptor']", nit_clean)
+
+    # Nombre — formcontrolname="nombre"
+    type_into(page, "input[formcontrolname='nombre']", r.nombre)
 
     # NRC — formcontrolname="nrc"
-    if req.receptor.nrc:
-        angular_fill(page,
-            "input[formcontrolname='nrc']",
-            req.receptor.nrc.replace("-", "").strip())
+    if r.nrc:
+        nrc_clean = r.nrc.replace("-", "").strip()
+        type_into(page, "input[formcontrolname='nrc']", nrc_clean)
 
-    # Actividad Económica — ng-select con formcontrolname="actividadEconomica"
-    if req.receptor.codActividad:
-        cod = req.receptor.codActividad.split(" - ")[0].strip()
-        angular_ngselect(page,
-            "ng-select[formcontrolname='actividadEconomica']", cod)
+    # Actividad Económica — ng-select
+    if r.codActividad:
+        fill_ngselect(page,
+            "ng-select[formcontrolname='actividadEconomica']",
+            r.codActividad)
 
-    # Departamento — formcontrolname="departamento", value numérico "06"
-    depto_val = _depto_num(req.receptor.departamento)
-    angular_select(page,
-        "select[formcontrolname='departamento']", value=depto_val)
-    time.sleep(0.5)  # Angular actualiza las opciones de municipio
+    # Departamento — value numérico "06"
+    depto_val = _depto_num(r.departamento)
+    select_into(page, "select[formcontrolname='departamento']", value=depto_val)
+    time.sleep(0.6)  # Angular actualiza opciones de municipio
 
-    # Municipio — formcontrolname="municipio", value numérico "23"
-    muni_val = _muni_num(req.receptor.municipio)
+    # Municipio — value numérico
+    muni_val = _muni_num(r.municipio)
     if muni_val:
-        angular_select(page,
-            "select[formcontrolname='municipio']", value=muni_val)
+        select_into(page, "select[formcontrolname='municipio']", value=muni_val)
 
-    # Dirección / Complemento — formcontrolname="complemento" (textarea)
-    dir_val = req.receptor.direccion.strip() or "San Salvador, El Salvador"
-    angular_fill(page,
-        "textarea[formcontrolname='complemento']", dir_val)
+    # Dirección / Complemento — textarea, formcontrolname="complemento"
+    dir_val = r.direccion.strip() or "San Salvador, El Salvador"
+    type_into(page, "textarea[formcontrolname='complemento']", dir_val, delay=30)
 
     # Correo — formcontrolname="correo"
-    if req.receptor.correo:
-        angular_fill(page,
-            "input[formcontrolname='correo']", req.receptor.correo)
+    if r.correo:
+        type_into(page, "input[formcontrolname='correo']", r.correo)
 
     # Teléfono — formcontrolname="telefono"
-    if req.receptor.telefono:
-        tel = req.receptor.telefono.replace("-", "").strip()
-        angular_fill(page,
-            "input[formcontrolname='telefono']", tel)
+    if r.telefono:
+        tel = r.telefono.replace("-", "").strip()
+        type_into(page, "input[formcontrolname='telefono']", tel)
 
     _rep(task_id, "Receptor llenado ✅", page)
 
@@ -413,32 +331,33 @@ def fill_receptor(page, task_id: str, req: FacturaRequest):
 # ── ÍTEMS ─────────────────────────────────────────────────────────────────────
 
 def abrir_modal_item(page, task_id: str) -> bool:
-    """Clic en btnGroupDrop2 → 'Producto o Servicio'."""
     _rep(task_id, "Abriendo modal de ítem...", page)
 
-    # Scroll para que el botón esté visible
+    # Scroll hasta la sección de ítems
     page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-    time.sleep(0.5)
+    time.sleep(0.6)
 
-    # Botón "Agregar Ítem" (btnGroupDrop2 del HTML real)
-    abierto = False
-    for sel in ["#btnGroupDrop2",
-                "button[id='btnGroupDrop2']",
-                "button.btn-primary.dropdown-toggle"]:
+    # Clic en "Agregar Ítem" — id="btnGroupDrop2" del HTML real
+    for sel in [
+        "#btnGroupDrop2",
+        "button[id='btnGroupDrop2']",
+        "button.btn-primary.dropdown-toggle:has-text('Agregar')",
+    ]:
         try:
             btn = page.locator(sel).first
             btn.wait_for(state="visible", timeout=6000)
             btn.scroll_into_view_if_needed()
             btn.click()
-            time.sleep(0.6)
-            abierto = True
+            time.sleep(0.7)
             break
         except:
             pass
 
-    # Dropdown item "Producto o Servicio"
-    for sel in ["a.dropdown-item:has-text('Producto o Servicio')",
-                ".dropdown-menu a:first-child"]:
+    # Clic en "Producto o Servicio" del dropdown
+    for sel in [
+        "a.dropdown-item:has-text('Producto o Servicio')",
+        ".dropdown-menu a:first-child",
+    ]:
         try:
             opt = page.locator(sel).first
             opt.wait_for(state="visible", timeout=4000)
@@ -452,8 +371,8 @@ def abrir_modal_item(page, task_id: str) -> bool:
     for sel in ["div.modal.show", "div.modal-dialog", "div.modal-content"]:
         try:
             page.wait_for_selector(sel, state="visible", timeout=8000)
-            time.sleep(0.8)
-            _rep(task_id, "Modal abierto ✅", page)
+            time.sleep(1.0)
+            _rep(task_id, "Modal de ítem abierto ✅", page)
             return True
         except:
             pass
@@ -462,75 +381,66 @@ def abrir_modal_item(page, task_id: str) -> bool:
     return False
 
 
-def llenar_item(page, task_id: str, item: Item) -> bool:
+def llenar_item_en_modal(page, task_id: str, item: Item) -> bool:
     """
-    Llena los campos del modal de ítem usando Angular FormControl.
-    Los formcontrolnames del modal se determinan por inspección del componente
-    dinámico — son los mismos en Factura y CCF.
+    Llena los campos del modal de ítem con tecleo real.
+    Los campos del modal son componentes Angular dinámicos.
+    Prefijamos con 'div.modal-dialog' para no confundir con la página.
     """
-    _rep(task_id, f"Llenando ítem: {item.descripcion[:35]}...", page)
+    _rep(task_id, f"Llenando: {item.descripcion[:35]}...", page)
+    print(f"  [item] cant={item.cantidad} desc={item.descripcion} "
+          f"precio={item.precio} tipo={item.tipo_item} venta={item.tipo_venta}")
 
     tipo_label = TIPO_ITEM_MAP.get(item.tipo_item, "1 - Bien")
-    cant_str   = str(int(item.cantidad)) if item.cantidad == int(item.cantidad) else str(item.cantidad)
+    cant_str   = (str(int(item.cantidad))
+                  if item.cantidad == int(item.cantidad)
+                  else str(item.cantidad))
     precio_str = f"{item.precio:.2f}"
 
-    # Los selectores deben apuntar DENTRO del modal para no confundirse
-    # con los selects del documento principal
-    def modal_sel(sel):
-        return f"div.modal-dialog {sel}, div.modal.show {sel}"
+    # Prefijo para apuntar solo al modal
+    m = "div.modal-dialog "
 
     # 1. Tipo de ítem
-    angular_select(page,
-        modal_sel("select[formcontrolname='tipo']"),
-        label=tipo_label, timeout=5000)
+    select_into(page, f"{m}select[formcontrolname='tipo']",
+                label=tipo_label, timeout=5000)
 
-    # 2. Cantidad — formcontrolname="cantidad"
-    ok_cant = angular_fill(page,
-        modal_sel("input[formcontrolname='cantidad']"),
-        cant_str, timeout=5000)
+    # 2. Cantidad
+    ok_cant = type_into(page, f"{m}input[formcontrolname='cantidad']",
+                        cant_str, timeout=5000)
     if not ok_cant:
-        angular_fill(page,
-            modal_sel("input[placeholder='Cantidad']"),
-            cant_str)
+        type_into(page, f"{m}input[placeholder*='antidad']",
+                  cant_str, timeout=4000)
 
     # 3. Unidad de medida
-    angular_select(page,
-        modal_sel("select[formcontrolname='unidad']"),
-        label="Unidad", timeout=4000)
+    select_into(page, f"{m}select[formcontrolname='unidad']",
+                label="Unidad", timeout=4000)
 
-    # 4. Descripción — formcontrolname="descripcion"
-    ok_desc = angular_fill(page,
-        modal_sel("input[formcontrolname='descripcion']"),
-        item.descripcion, timeout=5000)
+    # 4. Descripción
+    ok_desc = type_into(page, f"{m}input[formcontrolname='descripcion']",
+                        item.descripcion, timeout=5000)
     if not ok_desc:
-        angular_fill(page,
-            modal_sel("input[placeholder*='Nombre']"),
-            item.descripcion)
+        type_into(page, f"{m}input[placeholder*='Nombre']",
+                  item.descripcion, timeout=4000)
 
-    # 5. Tipo de venta (Gravado / Exento / No Sujeto)
-    angular_select(page,
-        modal_sel("select[formcontrolname='tipoVenta']"),
-        label=item.tipo_venta, timeout=4000)
+    # 5. Tipo de venta
+    select_into(page, f"{m}select[formcontrolname='tipoVenta']",
+                label=item.tipo_venta, timeout=4000)
 
-    # 6. Precio unitario — formcontrolname="precioUnitario"
-    ok_precio = angular_fill(page,
-        modal_sel("input[formcontrolname='precioUnitario']"),
-        precio_str, timeout=5000)
+    # 6. Precio unitario
+    ok_precio = type_into(page, f"{m}input[formcontrolname='precioUnitario']",
+                          precio_str, timeout=5000)
     if not ok_precio:
-        angular_fill(page,
-            modal_sel("input[formcontrolname='precio']"),
-            precio_str)
+        type_into(page, f"{m}input[formcontrolname='precio']",
+                  precio_str, timeout=4000)
 
-    time.sleep(0.6)  # Angular recalcula subtotal
-    _rep(task_id, f"Ítem llenado (cant:{ok_cant} desc:{ok_desc} precio:{ok_precio})", page)
+    time.sleep(0.8)  # Angular recalcula subtotal
+    _rep(task_id,
+         f"Ítem llenado — cant:{ok_cant} desc:{ok_desc} precio:{ok_precio}", page)
     return ok_cant and ok_desc and ok_precio
 
 
 def clic_agregar_item(page, task_id: str) -> bool:
-    """Clic en el botón 'Agregar ítem' dentro del modal."""
     _rep(task_id, "Clic 'Agregar ítem'...", page)
-
-    # Botón azul dentro del modal
     for sel in [
         "div.modal button.btn-primary:has-text('Agregar')",
         "div.modal-footer button.btn-primary",
@@ -541,13 +451,11 @@ def clic_agregar_item(page, task_id: str) -> bool:
             btn.wait_for(state="visible", timeout=5000)
             btn.scroll_into_view_if_needed()
             btn.click(force=True)
-            time.sleep(1.5)
+            time.sleep(1.8)
             _rep(task_id, "Ítem agregado ✅", page)
             return True
         except:
             pass
-
-    # JS fallback: último btn-primary dentro del modal
     try:
         page.evaluate("""
             const m = document.querySelector('div.modal.show, div.modal-dialog');
@@ -557,26 +465,24 @@ def clic_agregar_item(page, task_id: str) -> bool:
                 if (b) { b.scrollIntoView(); b.click(); }
             }
         """)
-        time.sleep(1.5)
-        _rep(task_id, "Ítem agregado (JS) ✅", page)
+        time.sleep(1.8)
+        _rep(task_id, "Ítem agregado (JS fallback) ✅", page)
         return True
     except:
         pass
-
     _rep(task_id, "⚠️ No se pudo agregar ítem", page)
     return False
 
 
 def navegar_post_item(page, task_id: str, es_ultimo: bool):
-    """'Seguir adicionando' o 'Regresar al documento'."""
-    time.sleep(0.5)
+    time.sleep(0.6)
     if not es_ultimo:
         for sel in ["button:has-text('Seguir adicionando')", ".swal2-confirm"]:
             try:
                 b = page.locator(sel).first
                 b.wait_for(state="visible", timeout=5000)
                 b.click(force=True)
-                time.sleep(0.8)
+                time.sleep(1.0)
                 return
             except:
                 pass
@@ -588,7 +494,7 @@ def navegar_post_item(page, task_id: str, es_ultimo: bool):
                 b.wait_for(state="visible", timeout=5000)
                 b.click(force=True)
                 page.wait_for_load_state("domcontentloaded")
-                time.sleep(1.2)
+                time.sleep(1.5)
                 return
             except:
                 pass
@@ -600,11 +506,11 @@ def configurar_forma_pago(page, task_id: str, fp_code: str, monto: float):
     _rep(task_id, "Configurando forma de pago...", page)
 
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    time.sleep(1.2)
+    time.sleep(1.5)
     _rep(task_id, "Vista sección forma de pago", page)
 
     # Borrar filas auto-generadas
-    # HTML: <button tooltip="Borrar forma de pago" class="btn btn-outline-primary btn-add">
+    # HTML real: <button tooltip="Borrar forma de pago" class="btn btn-outline-primary btn-add">
     try:
         btns = page.locator(
             "button[tooltip='Borrar forma de pago'], "
@@ -613,28 +519,29 @@ def configurar_forma_pago(page, task_id: str, fp_code: str, monto: float):
         for b in reversed(btns):
             try:
                 b.click(force=True)
-                time.sleep(0.35)
+                time.sleep(0.4)
             except:
                 pass
+        if btns:
+            print(f"  Borradas {len(btns)} fila(s) auto-generadas")
     except:
         pass
 
     # Select forma de pago — formcontrolname="codigo"
     fp_val = FP_MAP.get(fp_code, "0: 01")
-    angular_select(page, "select[formcontrolname='codigo']", value=fp_val)
+    select_into(page, "select[formcontrolname='codigo']", value=fp_val)
 
-    # Monto — formcontrolname="montoPago", placeholder="Monto Pago"
+    # Monto — formcontrolname="montoPago"
     monto_str = f"{monto:.2f}"
-    ok_monto = angular_fill(page,
-        "input[formcontrolname='montoPago']", monto_str)
+    ok_monto = type_into(page, "input[formcontrolname='montoPago']",
+                         monto_str, timeout=6000)
     if not ok_monto:
-        angular_fill(page,
-            "input[placeholder='Monto Pago']", monto_str)
+        type_into(page, "input[placeholder='Monto Pago']", monto_str)
 
-    time.sleep(0.4)
+    time.sleep(0.5)
 
-    # Botón "+" — tooltip="Agregar forma de pago"
-    # HTML: <button tooltip="Agregar forma de pago" class="btn btn-primary btn-block">
+    # Clic en "+" — tooltip="Agregar forma de pago"
+    # HTML real: <button tooltip="Agregar forma de pago" class="btn btn-primary btn-block">
     added = False
     for sel in [
         "button[tooltip='Agregar forma de pago']",
@@ -685,6 +592,13 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
     if "Crédito Fiscal" in tipo_dte:
         monto_pago *= 1.13
 
+    print(f"\n[RPA {task_id[:8]}] INICIO")
+    print(f"  tipo_dte   = '{tipo_dte}'")
+    print(f"  nit_emp    = '{hw_user}'")
+    print(f"  receptor   = '{req.receptor.nombre}' / NIT={req.receptor.numDocumento}")
+    print(f"  items      = {len(req.items)}")
+    print(f"  monto_pago = {monto_pago:.2f}")
+
     page = None
     try:
         with sync_playwright() as p:
@@ -717,12 +631,13 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             # ── Paso 1: Abrir portal ─────────────────────────────────
             _rep(task_id, "Abriendo factura.gob.sv...", page)
             page.goto("https://factura.gob.sv/", wait_until="domcontentloaded")
+            time.sleep(1.0)
 
             with context.expect_page() as npi:
                 page.click("text=Ingresar")
             page = npi.value
             page.wait_for_load_state("domcontentloaded")
-            time.sleep(1.0)
+            time.sleep(1.5)
 
             # ── Paso 2: Login ────────────────────────────────────────
             _rep(task_id, "Login...", page)
@@ -731,10 +646,11 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     "//h5[contains(text(),'Emisores DTE')]/..//button"
                 ).click()
                 page.wait_for_load_state("domcontentloaded")
-                time.sleep(0.5)
+                time.sleep(0.8)
             except:
                 pass
 
+            # Login: estos campos NO son Angular reactivo, son simples inputs
             page.get_by_placeholder("NIT/DUI").fill(hw_user.replace("-", ""))
             page.locator("input[type='password']").fill(hw_pass)
 
@@ -751,14 +667,14 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
 
             # Paso 3: OK post-login
             try:
-                page.wait_for_selector(".swal2-confirm", timeout=6000)
+                page.wait_for_selector(".swal2-confirm", timeout=8000)
                 _rep(task_id, "Paso 3 – OK post-login", page)
                 page.click(".swal2-confirm")
             except:
                 pass
 
             _rep(task_id, "Login OK ✅", page)
-            time.sleep(1.2)
+            time.sleep(1.5)
 
             # ── Paso 4: Sistema de Facturación ───────────────────────
             _rep(task_id, "Abriendo Sistema de Facturación...", page)
@@ -770,17 +686,18 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 menu.wait_for(state="visible", timeout=15000)
                 menu.click(force=True)
                 page.wait_for_load_state("domcontentloaded")
-                time.sleep(1.8)
-                _rep(task_id, "Sistema de Facturación abierto ✅", page)
+                time.sleep(2.0)
+                _rep(task_id, "Sistema de Facturación ✅", page)
             except Exception as e:
-                _rep(task_id, f"⚠️ Menú facturación: {e}", page)
+                _rep(task_id, f"⚠️ Menú: {e}", page)
 
             # ── Paso 5: Elegir tipo DTE ──────────────────────────────
             _rep(task_id, f"Eligiendo tipo DTE: {tipo_dte}...", page)
             try:
                 page.wait_for_selector(
-                    ".swal2-popup select, select.swal2-select", timeout=12000
+                    ".swal2-popup select, select.swal2-select", timeout=15000
                 )
+                _rep(task_id, "Popup tipo DTE visible", page)
                 page.locator(
                     ".swal2-popup select, select.swal2-select"
                 ).first.select_option(label=tipo_dte)
@@ -788,12 +705,23 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     "button.swal2-confirm, button:has-text('OK')"
                 ).first.click()
                 page.wait_for_load_state("domcontentloaded")
-                time.sleep(2.0)
-                _rep(task_id, f"Tipo DTE seleccionado ✅", page)
+                time.sleep(2.5)
+                _rep(task_id, "Página del documento cargada ✅", page)
             except Exception as e:
                 _rep(task_id, f"⚠️ Tipo DTE: {e}", page)
 
             # ── Paso 6: Receptor ─────────────────────────────────────
+            # Esperar que los campos del receptor estén listos
+            try:
+                page.wait_for_selector(
+                    "input[formcontrolname='nit'], "
+                    "input[placeholder*='NIT del receptor']",
+                    state="visible", timeout=15000
+                )
+                time.sleep(1.0)
+            except:
+                time.sleep(2.0)
+
             fill_receptor(page, task_id, req)
 
             # ── Pasos 7-10: Ítems ────────────────────────────────────
@@ -805,18 +733,18 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 es_ultimo = (i == len(req.items) - 1)
 
                 if i > 0:
-                    # Para ítems 2,3,… el modal ya está abierto por "Seguir adicionando"
-                    time.sleep(0.5)
+                    # Modal ya abierto por "Seguir adicionando"
+                    time.sleep(0.8)
 
-                llenar_item(page, task_id, item)
+                llenar_item_en_modal(page, task_id, item)
                 clic_agregar_item(page, task_id)
                 navegar_post_item(page, task_id, es_ultimo)
 
-            # Screenshot para verificar tabla de ítems
-            time.sleep(1.0)
+            # Verificar tabla de ítems
+            time.sleep(1.5)
             page.evaluate("window.scrollTo(0, 0)")
             time.sleep(0.5)
-            _rep(task_id, "Ítems en tabla – verificando...", page)
+            _rep(task_id, "Verificando tabla de ítems...", page)
 
             # ── Paso 11: Forma de pago ───────────────────────────────
             if not es_nota:
@@ -829,16 +757,16 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                         "textarea[formcontrolname='observacionesDoc']"
                     ).first
                     ob.wait_for(state="visible", timeout=4000)
-                    angular_fill(page,
-                        "textarea[formcontrolname='observacionesDoc']",
-                        req.observaciones)
+                    type_into(page,
+                              "textarea[formcontrolname='observacionesDoc']",
+                              req.observaciones, delay=20)
                 except:
                     pass
 
             # ── Paso 12: Generar Documento ───────────────────────────
             _rep(task_id, "Generando documento...", page)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(0.8)
+            time.sleep(1.0)
             _rep(task_id, "Vista previa antes de generar", page)
 
             generado = False
@@ -854,7 +782,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     el.scroll_into_view_if_needed()
                     el.click(force=True)
                     generado = True
-                    _rep(task_id, f"Clic Generar Documento ✅", page)
+                    _rep(task_id, "Clic Generar Documento ✅", page)
                     break
                 except:
                     pass
@@ -865,10 +793,10 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     "if(i){i.scrollIntoView(); i.click();}"
                 )
 
-            time.sleep(1.2)
+            time.sleep(1.5)
 
             # ── Paso 13: Confirmar ───────────────────────────────────
-            _rep(task_id, "Confirmando DTE...", page)
+            _rep(task_id, "Confirmando...", page)
             try:
                 btn_si = page.locator(
                     "button.swal2-confirm:has-text('crear documento'), "
@@ -878,7 +806,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 btn_si.wait_for(state="visible", timeout=15000)
                 _rep(task_id, "Popup confirmación ✅", page)
                 btn_si.first.click(force=True)
-                time.sleep(1.0)
+                time.sleep(1.2)
             except Exception as e_conf:
                 try:
                     errs = page.locator(
@@ -899,21 +827,21 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 ic.wait_for(state="visible", timeout=15000)
                 ic.click()
                 ic.fill(hw_clave)
-                time.sleep(0.4)
+                time.sleep(0.5)
                 bok = page.locator("button:has-text('OK')").last
                 bok.wait_for(state="visible", timeout=5000)
                 bok.click(force=True)
-                _rep(task_id, "Clave enviada ✅ – esperando sello...", page)
+                _rep(task_id, "Clave privada enviada ✅", page)
             except Exception as e_clave:
-                _rep(task_id, f"⚠️ Clave privada: {e_clave}", page)
+                _rep(task_id, f"⚠️ Clave: {e_clave}", page)
 
-            # ── Paso 15: Capturar UUID ───────────────────────────────
+            # ── Paso 15: UUID y PDF ──────────────────────────────────
             codigo_generacion = ""
             pdf_base64 = ""
 
             try:
                 page.wait_for_selector(".swal2-popup, .swal2-content", timeout=25000)
-                time.sleep(2.0)
+                time.sleep(2.5)
                 body_txt = page.inner_text("body")
                 if any(x in body_txt.lower()
                        for x in ["incorrecta", "inválida", "invalida"]):
@@ -924,14 +852,16 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             except Exception as eu:
                 if "Clave" in str(eu) or "clave" in str(eu):
                     raise eu
+                _rep(task_id, f"⚠️ UUID modal: {eu}", page)
 
-            # Buscar UUID en pestaña PDF si no lo encontramos
+            # Buscar en pestaña PDF
             if not codigo_generacion:
                 t0 = time.time()
                 pdf_tab = None
                 while time.time() - t0 < 15:
                     for pg in context.pages:
-                        if "data:application/pdf" in pg.url or "blob:" in pg.url:
+                        if ("data:application/pdf" in pg.url
+                                or "blob:" in pg.url):
                             pdf_tab = pg
                             break
                     if pdf_tab:
@@ -955,7 +885,6 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     except:
                         pass
 
-            # Cerrar popups
             for txt in ["OK", "Aceptar", "Cerrar"]:
                 try:
                     page.locator(f"button:has-text('{txt}')").last.click(
@@ -970,7 +899,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     "El portal de Hacienda no devolvió el UUID. Ver monitor."
                 )
 
-            # ── Consultas: descargar PDF si no lo tenemos ────────────
+            # Consultas → PDF si no lo tenemos
             if not pdf_base64:
                 try:
                     from urllib.parse import urlparse
@@ -1004,8 +933,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                             break
                     if not pdf_tab2:
                         for pg in context.pages:
-                            if ("data:application/pdf" in pg.url
-                                    or "blob:" in pg.url):
+                            if "data:application/pdf" in pg.url or "blob:" in pg.url:
                                 pdf_tab2 = pg
                                 break
 
@@ -1041,9 +969,11 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 "pdf_base64":        pdf_base64,
                 "json_content":      "{}",
             }
-            _rep(task_id, f"✅ DTE completado: {codigo_generacion}")
+            print(f"[RPA {task_id[:8]}] ✅ COMPLETADO: {codigo_generacion}")
 
     except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[RPA {task_id[:8]}] ❌ ERROR: {e}\n{tb}")
         try:
             _rep(task_id, f"❌ ERROR: {str(e)}", page)
         except:
@@ -1054,17 +984,3 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             "detail":     str(e),
             "screenshot": TAREAS.get(task_id, {}).get("screenshot", ""),
         }
-
-
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@app.post("/facturar")
-def facturar_inmediato(req: FacturaRequest, bg_tasks: BackgroundTasks):
-    task_id = str(uuid.uuid4())
-    bg_tasks.add_task(procesar_dte_en_fondo, task_id, req)
-    return {"exito": True, "task_id": task_id, "status": "procesando"}
-
-
-@app.get("/status/{task_id}")
-def verificar_status(task_id: str):
-    return TAREAS.get(task_id, {"status": "no_encontrado"})

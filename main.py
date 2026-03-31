@@ -1,7 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
-from playwright.sync_api import sync_playwright
-import time, re, json, base64, uuid
+from playwright.sync_api import sync_playwright, TimeoutError
+import time, re, base64, uuid
 
 app = FastAPI()
 TAREAS = {}
@@ -53,69 +53,81 @@ def reportar_paso(task_id, mensaje, page=None):
 
 def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
     TAREAS[task_id] = {"status": "procesando", "mensaje": "Iniciando navegador...", "screenshot": ""}
-    hw_user, hw_pass, hw_clave = req.nit_empresa, req.clave_hacienda, (req.clave_firma if req.clave_firma else req.clave_hacienda)
-    tipo_dte, es_nota = req.tipo_dte, req.tipo_dte in ("Nota de Crédito", "Nota de Débito")
+    hw_user = req.nit_empresa
+    hw_pass = req.clave_hacienda
+    hw_clave = req.clave_firma if req.clave_firma else req.clave_hacienda
+    tipo_dte = req.tipo_dte
+    es_nota = tipo_dte in ("Nota de Crédito", "Nota de Débito")
     forma_pago = req.formas_pago[0] if req.formas_pago else "01"
     
     monto_pago = sum([i.cantidad * i.precio for i in req.items])
-    if tipo_dte == "Comprobante de Crédito Fiscal": monto_pago = monto_pago * 1.13
+    if tipo_dte == "Comprobante de Crédito Fiscal": 
+        monto_pago = monto_pago * 1.13 # Sumar IVA
 
     try:
         with sync_playwright() as p:
-            # ESTOS ARGUMENTOS SON VITALES PARA DOCKER/RENDER
             browser = p.chromium.launch(
                 headless=True, 
                 args=[
                     '--disable-blink-features=AutomationControlled',
-                    '--no-sandbox',            # Obligatorio en Docker
-                    '--disable-setuid-sandbox',# Obligatorio en Docker
-                    '--disable-dev-shm-usage', # Evita que Render se quede sin memoria RAM
-                    '--disable-gpu'            # Render no tiene tarjeta gráfica
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu'
                 ]
             )
-            context = browser.new_context(viewport={"width": 1366, "height": 768}, accept_downloads=True, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            context = browser.new_context(viewport={"width": 1366, "height": 768}, accept_downloads=True)
             page = context.new_page()
-            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["media"] else route.continue_())
 
+            # 1. LOGIN
             reportar_paso(task_id, "Iniciando sesión...", page)
             page.goto("https://factura.gob.sv/", wait_until="domcontentloaded")
-            with context.expect_page() as npi: page.click("text=Ingresar")
+            with context.expect_page() as npi: 
+                page.click("text=Ingresar")
             page = npi.value
-            try: page.locator("//h5[contains(text(),'Emisores DTE')]/..//button").click()
+            
+            # Cerrar popup si existe
+            try: page.locator("//h5[contains(text(),'Emisores DTE')]/..//button").click(timeout=3000)
             except: pass
             
             page.get_by_placeholder("NIT/DUI").fill(hw_user.replace("-", ""))
             page.locator("input[type='password']").fill(hw_pass)
-            try: page.locator("select[formcontrolname='ambiente']").first.select_option(value="/test"); time.sleep(0.5) 
+            
+            # Selector de ambiente de pruebas si estuviera visible
+            try: page.locator("select[formcontrolname='ambiente']").first.select_option(value="/test", timeout=1000) 
             except: pass
+            
             page.click("button:has-text('Iniciar sesión')")
-            try: page.wait_for_selector(".swal2-confirm", timeout=3000); page.click(".swal2-confirm")
+            try: page.locator(".swal2-confirm").click(timeout=4000)
             except: pass
 
+            # 2. SELECCIONAR TIPO DE DOCUMENTO
             reportar_paso(task_id, "Entrando al facturador...", page)
-            try:
-                page.locator("text=Sistema de facturación").wait_for(state="visible", timeout=10000)
-                page.click("text=Sistema de facturación", force=True)
-                page.wait_for_load_state("domcontentloaded")
-            except: pass
-
+            page.locator("text=Sistema de facturación").wait_for(state="visible", timeout=15000)
+            page.click("text=Sistema de facturación", force=True)
+            
             try:
                 page.wait_for_selector(".swal2-popup select, select.swal2-select", timeout=10000)
                 page.locator(".swal2-popup select, select.swal2-select").first.select_option(label=tipo_dte)
                 page.locator("button.swal2-confirm, button:has-text('OK')").first.click()
             except: pass
 
+            time.sleep(2) # Esperar a que cargue el formulario Angular
+
+            # 3. LLENAR DATOS DEL CLIENTE
             reportar_paso(task_id, "Llenando cliente...", page)
+            nit_clean = req.receptor.numDocumento.replace("-", "")
+            
             if not es_nota and not ("Crédito Fiscal" in tipo_dte):
                 try: page.locator("select[formcontrolname='tipoDocumento']").first.select_option(label="NIT")
                 except: pass
 
-            nit_clean = req.receptor.numDocumento.replace("-", "")
-            try: page.locator("input[placeholder^='Digite el número de']").first.fill(nit_clean)
+            try: 
+                page.locator("input[placeholder^='Digite el número de']").first.fill(nit_clean)
             except: 
-                try: page.locator("input[formcontrolname='numDocumento']").first.fill(nit_clean)
-                except: pass
+                page.locator("input[formcontrolname='numDocumento']").first.fill(nit_clean)
 
+            # Llenado especial para CCF
             if ("Crédito Fiscal" in tipo_dte) or es_nota:
                 if req.receptor.nrc: 
                     try: page.locator("input[formcontrolname='nrc']").first.fill(req.receptor.nrc.replace("-", ""))
@@ -125,138 +137,144 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                         cod = req.receptor.codActividad.split(" - ")[0].strip()
                         a = page.locator("ng-select[formcontrolname='actividadEconomica']").first
                         a.click(force=True); time.sleep(0.5)
-                        a.locator("input[type='text']").first.fill(cod)
-                        time.sleep(1)
+                        a.locator("input[type='text']").first.fill(cod); time.sleep(1)
                         page.locator(f"div.ng-option:has-text('{cod}')").first.click(force=True)
-                        time.sleep(0.5)
                     except: pass
 
             try: page.locator("input[formcontrolname='nombre']").first.fill(req.receptor.nombre)
             except: pass
             
-            dir_val = req.receptor.direccion.strip()
-            if not dir_val: dir_val = "San Salvador, El Salvador"
+            dir_val = req.receptor.direccion.strip() or "San Salvador, El Salvador"
             try:
                 comp = page.locator("textarea[formcontrolname='complemento']").first
-                comp.clear(); comp.fill(dir_val); comp.press("Tab") 
+                comp.fill(dir_val)
+                comp.press("Tab") 
             except: pass
 
+            # 4. AGREGAR ÍTEMS (Basado en las capturas)
             reportar_paso(task_id, "Agregando ítems...", page)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+            
             for i, item in enumerate(req.items):
-                if i == 0:
-                    try:
-                        page.locator("button:has-text('Agregar Detalle'), #btnGroupDrop2").first.click()
-                        time.sleep(0.5)
-                        page.locator("a.dropdown-item:has-text('Producto o Servicio')").first.click()
-                        page.wait_for_selector("div.modal-dialog", timeout=5000)
-                        time.sleep(0.5)
-                    except: pass
+                # Desplegar menú: "Agregar Ítem" -> "Producto o Servicio"
+                page.locator("button:has-text('Agregar Ítem'), button:has-text('Agregar Detalle')").first.click()
+                time.sleep(0.5)
+                page.locator("a.dropdown-item:has-text('Producto o Servicio')").first.click()
                 
-                try: page.locator("select[formcontrolname='tipo']").first.select_option(label=TIPO_ITEM_MAP.get(item.tipo_item, "1 - Bien"))
-                except: pass
-                try: ci = page.locator("input[formcontrolname='cantidad']").first; ci.clear(); ci.fill(str(item.cantidad)); ci.press("Tab")
-                except: pass
-                try: page.locator("select[formcontrolname='unidad']").first.select_option(label="Unidad")
-                except: pass
-                try: desc_input = page.locator("input[formcontrolname='producto'], input[formcontrolname='descripcion']").first; desc_input.clear(); desc_input.fill(item.descripcion)
-                except: pass
-                try: page.locator("select[formcontrolname='tipoVenta']").first.select_option(label=item.tipo_venta)
-                except: pass
-                try: pi = page.locator("input[formcontrolname='precio'], input[formcontrolname='precioUnitario']").first; pi.clear(); pi.fill(f"{item.precio:.2f}"); pi.press("Tab"); time.sleep(0.5)
-                except: pass
-                
-                # INYECCIÓN JS 1: Forzar Agregar Item
-                try: 
-                    page.evaluate("Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Agregar ítem') || b.textContent.includes('Agregar Ítem')).click();")
-                    time.sleep(1.5)
-                except: pass
-                
-                # INYECCIÓN JS 2: Forzar Cerrar popup de éxito
-                try:
-                    if i < len(req.items) - 1: page.evaluate("Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Seguir adicionando')).click();")
-                    else: page.evaluate("Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Regresar al documento') || b.textContent.includes('OK')).click();")
-                except: pass
+                # Esperar a que abra el modal
+                page.wait_for_selector("div.modal-content", timeout=5000)
                 time.sleep(1)
 
-                try:
-                    btn_cancelar = page.locator("button[data-dismiss='modal']:has-text('Cancelar')").first
-                    if btn_cancelar.is_visible(): btn_cancelar.click(force=True); time.sleep(0.5)
-                except: pass
+                # Llenar modal de Item
+                page.locator("select[formcontrolname='tipo']").first.select_option(label=TIPO_ITEM_MAP.get(item.tipo_item, "1 - Bien"))
+                
+                cant_input = page.locator("input[formcontrolname='cantidad']").first
+                cant_input.clear(); cant_input.fill(str(item.cantidad))
+                
+                # Intentar seleccionar unidad "59 - Unidad" (basado en la captura) o solo "Unidad"
+                try: page.locator("select[formcontrolname='unidad']").first.select_option(label="59 - Unidad", timeout=1000)
+                except: page.locator("select[formcontrolname='unidad']").first.select_option(label="Unidad", timeout=1000)
 
+                desc_input = page.locator("input[formcontrolname='producto'], input[formcontrolname='descripcion']").first
+                desc_input.clear(); desc_input.fill(item.descripcion)
+                
+                page.locator("select[formcontrolname='tipoVenta']").first.select_option(label=item.tipo_venta)
+                
+                precio_input = page.locator("input[formcontrolname='precio'], input[formcontrolname='precioUnitario']").first
+                precio_input.clear(); precio_input.fill(f"{item.precio:.2f}"); precio_input.press("Tab")
+                
+                time.sleep(1) # Pequeña pausa para que Angular calcule los totales del item
+                
+                # Clic al botón azul "Agregar ítem" abajo a la izquierda del modal
+                page.locator("div.modal-footer button.btn-primary:has-text('Agregar ítem'), div.modal-footer button.btn-primary:has-text('Agregar Ítem')").first.click()
+                
+                time.sleep(1)
+
+                # Popup de confirmación (basado en la captura 5)
+                if i < len(req.items) - 1:
+                    page.locator("button:has-text('Seguir adicionando')").first.click()
+                else:
+                    page.locator("button:has-text('Regresar al documento')").first.click()
+                
+                time.sleep(1)
+
+            # 5. AGREGAR FORMA DE PAGO (Basado en capturas 7 y 8)
             if not es_nota:
                 reportar_paso(task_id, "Validando Pagos...", page)
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(0.5)
-                
-                # INYECCIÓN JS 3: ELIMINAR FILAS DE PAGO AUTO-CREADAS POR HACIENDA
-                try:
-                    page.evaluate("""
-                        const btns = document.querySelectorAll('table tbody tr button.btn-outline-primary');
-                        btns.forEach(b => b.click());
-                    """)
-                    time.sleep(0.5)
-                except: pass
+                time.sleep(1)
 
-                fp_val = {"01": "0: 01", "02": "3: 04", "03": "4: 05", "07": "1: 02", "99": "11: 99"}.get(forma_pago, "0: 01")
-                try: page.locator("select[formcontrolname='codigo']").first.select_option(value=fp_val)
+                # Seleccionar Billetes y Monedas
+                try:
+                    # El select de hacienda a veces usa valores en index. Intentamos por label primero.
+                    page.locator("select[formcontrolname='codigo']").first.select_option(label=re.compile("Billetes y monedas", re.IGNORECASE))
                 except: pass
+                
+                # Llenar monto
                 try:
                     mp = page.locator("input[formcontrolname='montoPago']").first
-                    mp.clear(); mp.fill(f"{monto_pago:.2f}"); mp.press("Tab"); time.sleep(0.5)
+                    mp.clear(); mp.fill(f"{monto_pago:.2f}"); mp.press("Tab")
                 except: pass
                 
-                # INYECCIÓN JS 4: AGREGAR FORMA DE PAGO SIN IMPORTAR OBSTÁCULOS
-                try: 
-                    page.evaluate("""
-                        const btn = document.querySelector("button[tooltip='Agregar forma de pago']") || Array.from(document.querySelectorAll('button')).find(b => b.innerHTML.includes('fa-plus'));
-                        if(btn) btn.click();
-                    """)
-                    time.sleep(1)
+                time.sleep(0.5)
+                
+                # Clic al botón AZUL [+] (basado en captura 7)
+                try:
+                    page.locator("button.btn-primary[tooltip='Agregar forma de pago'], button.btn-primary i.fa-plus").first.click(force=True)
                 except: pass
+                
+                time.sleep(1)
 
+            # 6. GENERAR Y FIRMAR
             reportar_paso(task_id, "Firma y Envío...", page)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(0.5)
+            time.sleep(1)
             
-            try: page.locator("input[value='Generar Documento'], button:has-text('Generar Documento')").first.click(force=True); time.sleep(1)
-            except: pass
+            # Botón "Generar Documento" (Captura 9)
+            page.locator("button:has-text('Generar Documento'), input[value='Generar Documento']").first.click()
+            time.sleep(1)
             
-            # INYECCIÓN JS 5: CONFIRMAR CREACIÓN AUNQUE HAYA OVERLAYS
-            try: 
-                page.evaluate("Array.from(document.querySelectorAll('button.swal2-confirm')).find(b => b.textContent.includes('crear documento')).click();")
-                time.sleep(1)
-            except: 
-                errs = page.locator("div[style*='background-color: #f8d7da'], div.alert-danger").all_inner_texts()
-                if errs: raise Exception("Datos incompletos en el formulario: " + " | ".join([e.replace('×', '').strip() for e in errs]))
+            # Modal de "¿Está seguro?"
+            page.locator("button.swal2-confirm:has-text('Si, crear documento')").first.click()
             
+            # 7. CLAVE PRIVADA (Captura 10)
             reportar_paso(task_id, "Clave Privada...", page)
             try:
                 ic = page.get_by_placeholder("Ingrese la clave privada de validación")
                 ic.wait_for(state="visible", timeout=8000)
                 ic.fill(hw_clave)
-                page.evaluate("Array.from(document.querySelectorAll('button.swal2-confirm')).find(b => b.textContent === 'OK').click();")
-            except: pass
+                page.locator("button.swal2-confirm:has-text('OK')").first.click()
+            except TimeoutError:
+                errs = page.locator("div.alert-danger, div.toast-message").all_inner_texts()
+                if errs: raise Exception("Error en validación: " + " | ".join(errs))
 
+            # 8. OBTENER PDF Y UUID
             reportar_paso(task_id, "Esperando sello oficial...", page)
             codigo_generacion, pdf_base64 = "", ""
+            
             def _extract_uuid(text):
                 m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
                 return m.group(0).upper() if m else ""
 
+            # Esperar a que salga la pantalla de éxito con el UUID
             try:
                 page.wait_for_selector(".swal2-popup, .swal2-content", timeout=20000)
                 time.sleep(1.5)
                 body_txt = page.inner_text("body")
-                if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower(): raise Exception("Clave privada incorrecta.")
+                if "incorrecta" in body_txt.lower() or "inválida" in body_txt.lower(): 
+                    raise Exception("Clave privada incorrecta.")
                 codigo_generacion = _extract_uuid(body_txt)
             except Exception as e:
-                if "Clave" in str(e) or "incompleto" in str(e): raise e
+                if "Clave" in str(e): raise e
 
+            # Capturar la pestaña nueva (PDF)
             t0 = time.time()
             pdf_tab = None
             while time.time() - t0 < 10:
                 for pg in context.pages:
-                    if "pdf" in pg.url.lower() or "blob:" in pg.url.lower(): pdf_tab = pg; break
+                    if "pdf" in pg.url.lower() or "blob:" in pg.url.lower(): 
+                        pdf_tab = pg
+                        break
                 if pdf_tab: break
                 time.sleep(1)
 
@@ -268,12 +286,8 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     pdf_base64 = base64.b64encode(bytes(pdf_bytes_js)).decode('utf-8')
                 except: pass
 
-            for btn_txt in ["OK", "Aceptar", "Cerrar"]:
-                try: page.locator(f"button:has-text('{btn_txt}')").last.click(force=True, timeout=1000); time.sleep(0.3)
-                except: pass
-
             if not pdf_base64 and codigo_generacion:
-                reportar_paso(task_id, "Recuperando PDF...", page)
+                reportar_paso(task_id, "Recuperando PDF del portal...", page)
                 try:
                     from urllib.parse import urlparse
                     base_url = f"{urlparse(page.url).scheme}://{urlparse(page.url).netloc}"
@@ -282,7 +296,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     page.locator("button:has-text('Consultar')").first.click()
                     page.wait_for_selector("tbody tr", timeout=10000); time.sleep(1.5)
                     pages_antes = set(id(p) for p in context.pages)
-                    page.locator("button[tooltip='Versión legible']").first.click(force=True); time.sleep(3)
+                    page.locator("button[tooltip='Versión legible']").first.click(force=True); time.sleep(4)
                     for pg in context.pages:
                         if id(pg) not in pages_antes or "pdf" in pg.url.lower() or "blob:" in pg.url.lower():
                             try:
@@ -292,13 +306,21 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                             break
                 except: pass
 
-            if not codigo_generacion: raise Exception("El portal de Hacienda no devolvió el UUID. Ver monitor.")
+            if not codigo_generacion: 
+                raise Exception("El portal de Hacienda no devolvió el UUID.")
 
             browser.close()
-            TAREAS[task_id] = {"status": "completado", "exito": True, "sello_recepcion": "IMPRESO-EN-EL-PDF", "codigo_generacion": codigo_generacion, "pdf_base64": pdf_base64, "json_content": "{}"}
+            TAREAS[task_id] = {
+                "status": "completado", 
+                "exito": True, 
+                "sello_recepcion": "IMPRESO-EN-EL-PDF", 
+                "codigo_generacion": codigo_generacion, 
+                "pdf_base64": pdf_base64, 
+                "json_content": "{}"
+            }
 
     except Exception as e:
-        try: reportar_paso(task_id, f"ERROR CRÍTICO: {str(e)}", page)
+        try: reportar_paso(task_id, f"ERROR: {str(e)}", page)
         except: pass
         TAREAS[task_id] = {"status": "error", "exito": False, "detail": str(e), "screenshot": TAREAS[task_id].get("screenshot", "")}
 
@@ -309,4 +331,5 @@ def facturar_inmediato(req: FacturaRequest, bg_tasks: BackgroundTasks):
     return {"exito": True, "task_id": task_id, "status": "procesando"}
 
 @app.get("/status/{task_id}")
-def verificar_status(task_id: str): return TAREAS.get(task_id, {"status": "no_encontrado"})
+def verificar_status(task_id: str): 
+    return TAREAS.get(task_id, {"status": "no_encontrado"})

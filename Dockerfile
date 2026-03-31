@@ -1,14 +1,17 @@
-FROM mcr.microsoft.com/playwright/python:v1.39.0-jammy
+# Actualizado a la versión 1.58.0 que exige Playwright
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
+# Directorio de trabajo
 WORKDIR /app
 
+# Copiamos los archivos y requerimientos
 COPY requirements.txt .
+
+# Instalamos FastAPI, Uvicorn, etc.
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copiamos tu archivo main.py
 COPY . .
 
-# Comando para iniciar Streamlit en el puerto de Render
-CMD ["sh", "-c", "streamlit run main.py --server.port ${PORT:-10000} --server.address 0.0.0.0"]
+# Comando para encender el servidor Robot
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]

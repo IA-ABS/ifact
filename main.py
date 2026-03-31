@@ -62,7 +62,15 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
+            browser = p.chromium.launch(
+    headless=True, 
+    args=[
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage', # Evita crasheos por falta de memoria en Docker
+        '--no-sandbox',            # Obligatorio para correr Chrome dentro de Docker
+        '--disable-gpu'            # Render no tiene GPU
+    ]
+)
             context = browser.new_context(viewport={"width": 1366, "height": 768}, accept_downloads=True, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             page = context.new_page()
             page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["media"] else route.continue_())

@@ -9,7 +9,7 @@ TAREAS: dict = {}
 
 # ── Modelos ───────────────────────────────────────────────────────────────────
 class Receptor(BaseModel):
-    tipo_doc: str = "NIT" # NUEVO CAMPO
+    tipo_doc: str = "NIT"
     numDocumento: str = ""
     nombre: str = ""
     nrc: str = ""
@@ -25,7 +25,7 @@ class Item(BaseModel):
     descripcion: str = ""
     precio: float = 0
     tipo_item: str = "1 - Bien"
-    tipo_venta: str = "Gravado" # NUEVO CAMPO
+    tipo_venta: str = "Gravado"
 
 class FacturaRequest(BaseModel):
     nit_empresa: str = ""
@@ -37,6 +37,9 @@ class FacturaRequest(BaseModel):
     formas_pago: list[str] = ["01"]
     condicion: str = "Contado"
     observaciones: str = ""
+    doc_rel_cod_generacion: str = ""
+    doc_rel_tipo_documento: str = "Comprobante de Crédito Fiscal"
+    doc_rel_fecha_desde: str = None
 
 # ── Constantes y Helpers ──────────────────────────────────────────────────────
 FP_MAP = {"01": "0: 01", "02": "1: 02", "03": "2: 03", "04": "3: 04", "05": "4: 05", "07": "1: 02", "99": "11: 99"}
@@ -131,7 +134,7 @@ async def facturar_inmediato(request: Request, bg_tasks: BackgroundTasks):
     except Exception as e:
         return JSONResponse({"exito": False, "error": f"Error parseando datos: {str(e)}"}, status_code=400)
 
-# ── PROCESO PRINCIPAL (RESTAURADO A TU LÓGICA ORIGINAL) ───────────────────────
+# ── PROCESO PRINCIPAL ─────────────────────────────────────────────────────────
 def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
     TAREAS[task_id] = {"status": "procesando", "mensaje": "Iniciando navegador...", "screenshot": ""}
 
@@ -152,17 +155,14 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             context = browser.new_context(viewport={"width": 1366, "height": 768}, accept_downloads=True, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             page = context.new_page()
 
-            # ── 1. LOGIN (LÓGICA DE NUEVA PESTAÑA RESTAURADA) ──
-            _rep(task_id, "Entrando a factura.gob.sv...", page)
-            page.goto("https://factura.gob.sv/", wait_until="domcontentloaded")
+            # ── 1. LOGIN DIRECTO AL PORTAL INTERNO (Evita el problema de pestañas y timeouts) ──
+            _rep(task_id, "Entrando directo al portal de Hacienda...", page)
             
-            with context.expect_page() as npi:
-                page.click("text=Ingresar")
-            page = npi.value
-            page.wait_for_load_state("domcontentloaded")
+            # Aumentamos el timeout a 60 segundos y vamos directo a admin.factura.gob.sv
+            page.goto("https://admin.factura.gob.sv/", timeout=60000)
             time.sleep(1.5)
 
-            # Clic en el botón azul "Emisores DTE" (El de tu captura de pantalla)
+            # Si aparece la tarjeta de "Emisores DTE" (A veces la muestra, a veces no)
             _rep(task_id, "Buscando botón Emisores DTE...", page)
             try:
                 btn_emisores = page.locator("button:has-text('Iniciar Sesión'), button:has-text('Emisores DTE')").first
@@ -173,7 +173,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
 
             _rep(task_id, "Escribiendo credenciales...", page)
             nit_input = page.locator("input[placeholder*='NIT'], input[placeholder*='DUI'], input[formcontrolname='usuario']").first
-            nit_input.wait_for(state="visible", timeout=10000)
+            nit_input.wait_for(state="visible", timeout=15000)
             nit_input.fill(hw_user.replace("-", ""))
 
             pass_input = page.locator("input[type='password'], input[formcontrolname='clave']").first
@@ -240,6 +240,37 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             type_into(page, "textarea[formcontrolname='complemento']", r.direccion or "San Salvador")
             if r.correo: type_into(page, "input[formcontrolname='correo']", r.correo)
             if r.telefono: type_into(page, "input[formcontrolname='telefono']", r.telefono.replace("-", ""))
+
+            # ── 4.5 DOCUMENTO RELACIONADO (NC/ND) ──
+            if es_nota and req.doc_rel_cod_generacion:
+                _rep(task_id, "Agregando documento relacionado...", page)
+                try:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    time.sleep(0.8)
+                    page.locator("#btnGroupDrop1, button.dropdown-toggle:has-text('Agregar Doc')").first.click()
+                    time.sleep(0.6)
+                    page.locator("a.dropdown-item:has-text('Electrónico')").first.click()
+                    time.sleep(1.2)
+                    
+                    sel_modal = page.locator("div.modal-body select, div.modal select").filter(has_text="Comprobante").first
+                    sel_modal.wait_for(state="visible", timeout=8000)
+                    sel_modal.select_option(label=req.doc_rel_tipo_documento)
+                    
+                    btn_consultar = page.locator("div.modal-body button:has-text('Consultar')").first
+                    btn_consultar.click()
+                    page.wait_for_selector("div.modal-body tbody tr", timeout=15000)
+                    time.sleep(1.5)
+                    
+                    filas = page.locator("div.modal-body tbody tr").all()
+                    cod_buscar = req.doc_rel_cod_generacion.strip().upper().replace("-", "")
+                    for fila in filas:
+                        if cod_buscar in fila.inner_text().upper().replace("-", ""):
+                            fila.locator("input[type='button'][value='+'], button:has-text('+')").first.click(force=True)
+                            break
+                    
+                    page.wait_for_selector("div.modal.show", state="hidden", timeout=10000)
+                except Exception as e:
+                    _rep(task_id, f"Error en doc relacionado: {e}", page)
 
             # ── 5. ÍTEMS ──
             _rep(task_id, f"Agregando {len(req.items)} producto(s)...", page)

@@ -79,27 +79,45 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             context = browser.new_context(viewport={"width": 1366, "height": 768}, accept_downloads=True)
             page = context.new_page()
 
-            # 1. LOGIN
-            reportar_paso(task_id, "Iniciando sesión...", page)
+            # 1. LOGIN MEJORADO (A prueba de fallos)
+            reportar_paso(task_id, "Abriendo portal de Hacienda...", page)
             page.goto("https://factura.gob.sv/", wait_until="domcontentloaded")
-            with context.expect_page() as npi: 
-                page.click("text=Ingresar")
-            page = npi.value
+            time.sleep(1)
+
+            # Intentar dar clic en Ingresar (A veces abre pestaña nueva, a veces no)
+            try:
+                with context.expect_page(timeout=8000) as npi: 
+                    page.locator("text=Ingresar").first.click()
+                page = npi.value
+            except:
+                try: page.locator("text=Ingresar").first.click(timeout=3000)
+                except: pass
             
-            # Cerrar popup si existe
-            try: page.locator("//h5[contains(text(),'Emisores DTE')]/..//button").click(timeout=3000)
+            reportar_paso(task_id, "Esperando formulario de login...", page)
+            time.sleep(3) # Pausa vital para que Angular cargue
+            
+            # Cerrar popup publicitario si sale
+            try: page.locator("button:has-text('×'), button.close").first.click(timeout=2000)
             except: pass
             
-            page.get_by_placeholder("NIT/DUI").fill(hw_user.replace("-", ""))
-            page.locator("input[type='password']").fill(hw_pass)
+            # Esperamos específicamente el campo de la contraseña, que nunca cambia de nombre
+            page.wait_for_selector("input[type='password']", timeout=25000)
             
-            # Selector de ambiente de pruebas si estuviera visible
+            # Llenar usuario usando selectores múltiples por si le cambian el nombre al placeholder
+            user_input = page.locator("input[placeholder*='NIT'], input[placeholder*='DUI'], input[formcontrolname='nombreUsuario'], input[type='text']").first
+            user_input.fill(hw_user.replace("-", ""))
+            
+            page.locator("input[type='password']").first.fill(hw_pass)
+            
             try: page.locator("select[formcontrolname='ambiente']").first.select_option(value="/test", timeout=1000) 
             except: pass
             
-            page.click("button:has-text('Iniciar sesión')")
-            try: page.locator(".swal2-confirm").click(timeout=4000)
+            page.locator("button:has-text('Iniciar sesión'), button:has-text('Ingresar')").first.click()
+            
+            # Esperar a que pase el inicio de sesión
+            try: page.locator(".swal2-confirm").first.click(timeout=4000)
             except: pass
+
 
             # 2. SELECCIONAR TIPO DE DOCUMENTO
             reportar_paso(task_id, "Entrando al facturador...", page)
@@ -112,7 +130,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 page.locator("button.swal2-confirm, button:has-text('OK')").first.click()
             except: pass
 
-            time.sleep(2) # Esperar a que cargue el formulario Angular
+            time.sleep(2)
 
             # 3. LLENAR DATOS DEL CLIENTE
             reportar_paso(task_id, "Llenando cliente...", page)
@@ -127,7 +145,6 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             except: 
                 page.locator("input[formcontrolname='numDocumento']").first.fill(nit_clean)
 
-            # Llenado especial para CCF
             if ("Crédito Fiscal" in tipo_dte) or es_nota:
                 if req.receptor.nrc: 
                     try: page.locator("input[formcontrolname='nrc']").first.fill(req.receptor.nrc.replace("-", ""))
@@ -151,27 +168,23 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 comp.press("Tab") 
             except: pass
 
-            # 4. AGREGAR ÍTEMS (Basado en las capturas)
+            # 4. AGREGAR ÍTEMS
             reportar_paso(task_id, "Agregando ítems...", page)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
             
             for i, item in enumerate(req.items):
-                # Desplegar menú: "Agregar Ítem" -> "Producto o Servicio"
                 page.locator("button:has-text('Agregar Ítem'), button:has-text('Agregar Detalle')").first.click()
                 time.sleep(0.5)
                 page.locator("a.dropdown-item:has-text('Producto o Servicio')").first.click()
                 
-                # Esperar a que abra el modal
                 page.wait_for_selector("div.modal-content", timeout=5000)
                 time.sleep(1)
 
-                # Llenar modal de Item
                 page.locator("select[formcontrolname='tipo']").first.select_option(label=TIPO_ITEM_MAP.get(item.tipo_item, "1 - Bien"))
                 
                 cant_input = page.locator("input[formcontrolname='cantidad']").first
                 cant_input.clear(); cant_input.fill(str(item.cantidad))
                 
-                # Intentar seleccionar unidad "59 - Unidad" (basado en la captura) o solo "Unidad"
                 try: page.locator("select[formcontrolname='unidad']").first.select_option(label="59 - Unidad", timeout=1000)
                 except: page.locator("select[formcontrolname='unidad']").first.select_option(label="Unidad", timeout=1000)
 
@@ -183,14 +196,12 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 precio_input = page.locator("input[formcontrolname='precio'], input[formcontrolname='precioUnitario']").first
                 precio_input.clear(); precio_input.fill(f"{item.precio:.2f}"); precio_input.press("Tab")
                 
-                time.sleep(1) # Pequeña pausa para que Angular calcule los totales del item
+                time.sleep(1) 
                 
-                # Clic al botón azul "Agregar ítem" abajo a la izquierda del modal
                 page.locator("div.modal-footer button.btn-primary:has-text('Agregar ítem'), div.modal-footer button.btn-primary:has-text('Agregar Ítem')").first.click()
                 
-                time.sleep(1)
+                time.sleep(1.5)
 
-                # Popup de confirmación (basado en la captura 5)
                 if i < len(req.items) - 1:
                     page.locator("button:has-text('Seguir adicionando')").first.click()
                 else:
@@ -198,19 +209,16 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 
                 time.sleep(1)
 
-            # 5. AGREGAR FORMA DE PAGO (Basado en capturas 7 y 8)
+            # 5. AGREGAR FORMA DE PAGO
             if not es_nota:
                 reportar_paso(task_id, "Validando Pagos...", page)
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 time.sleep(1)
 
-                # Seleccionar Billetes y Monedas
                 try:
-                    # El select de hacienda a veces usa valores en index. Intentamos por label primero.
                     page.locator("select[formcontrolname='codigo']").first.select_option(label=re.compile("Billetes y monedas", re.IGNORECASE))
                 except: pass
                 
-                # Llenar monto
                 try:
                     mp = page.locator("input[formcontrolname='montoPago']").first
                     mp.clear(); mp.fill(f"{monto_pago:.2f}"); mp.press("Tab")
@@ -218,7 +226,6 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 
                 time.sleep(0.5)
                 
-                # Clic al botón AZUL [+] (basado en captura 7)
                 try:
                     page.locator("button.btn-primary[tooltip='Agregar forma de pago'], button.btn-primary i.fa-plus").first.click(force=True)
                 except: pass
@@ -230,14 +237,12 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(1)
             
-            # Botón "Generar Documento" (Captura 9)
             page.locator("button:has-text('Generar Documento'), input[value='Generar Documento']").first.click()
             time.sleep(1)
             
-            # Modal de "¿Está seguro?"
             page.locator("button.swal2-confirm:has-text('Si, crear documento')").first.click()
             
-            # 7. CLAVE PRIVADA (Captura 10)
+            # 7. CLAVE PRIVADA
             reportar_paso(task_id, "Clave Privada...", page)
             try:
                 ic = page.get_by_placeholder("Ingrese la clave privada de validación")
@@ -256,7 +261,6 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
                 return m.group(0).upper() if m else ""
 
-            # Esperar a que salga la pantalla de éxito con el UUID
             try:
                 page.wait_for_selector(".swal2-popup, .swal2-content", timeout=20000)
                 time.sleep(1.5)
@@ -267,7 +271,6 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             except Exception as e:
                 if "Clave" in str(e): raise e
 
-            # Capturar la pestaña nueva (PDF)
             t0 = time.time()
             pdf_tab = None
             while time.time() - t0 < 10:

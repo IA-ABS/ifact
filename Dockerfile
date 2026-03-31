@@ -1,20 +1,20 @@
-# Usamos una imagen ligera de Python
-FROM python:3.10-slim
+# 1. Usamos la imagen oficial de Playwright (basada en Ubuntu 22.04 y Python)
+# Esta versión coincide con tu requirements.txt (1.39.0)
+FROM mcr.microsoft.com/playwright/python:v1.39.0-jammy
 
-# Directorio de trabajo
+# 2. Variables de entorno recomendadas para Python en Docker
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# 3. Directorio de trabajo
 WORKDIR /app
 
-# Copiamos los requerimientos primero para aprovechar el caché de Docker
+# 4. Copiamos e instalamos dependencias de Python (FastAPI, etc.)
 COPY requirements.txt .
-
-# Instalamos FastAPI, Playwright, etc.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ESTO ES LO MÁS IMPORTANTE: Instala Chromium y TODAS sus dependencias de Linux
-RUN playwright install --with-deps chromium
-
-# Copiamos el resto de tu código (main.py, etc.)
+# 5. Copiamos el resto de tu código
 COPY . .
 
-# Comando para iniciar FastAPI escuchando en el puerto dinámico de Render
+# 6. Exponemos el puerto de Render y arrancamos
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]

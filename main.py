@@ -1,7 +1,3 @@
-"""
-IABSTECH IFACT – Robot RPA factura.gob.sv (VERSIÓN BLINDADA)
-"""
-
 from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -11,33 +7,9 @@ import time, re, base64, uuid, json, traceback
 app = FastAPI()
 TAREAS: dict = {}
 
-@app.post("/facturar")
-async def facturar_inmediato(request: Request, bg_tasks: BackgroundTasks):
-    try:
-        body_bytes = await request.body()
-        body_str   = body_bytes.decode("utf-8")
-        print(f"\n[FACTURAR] Body recibido: {body_str[:300]}...")
-
-        data = json.loads(body_str)
-        req  = FacturaRequest(**data)
-
-        task_id = str(uuid.uuid4())
-        bg_tasks.add_task(procesar_dte_en_fondo, task_id, req)
-        return JSONResponse({"exito": True, "task_id": task_id, "status": "procesando"})
-
-    except Exception as e:
-        return JSONResponse({"exito": False, "error": f"Error parseando datos: {str(e)}"}, status_code=400)
-
-@app.get("/status/{task_id}")
-def verificar_status(task_id: str):
-    return TAREAS.get(task_id, {"status": "no_encontrado"})
-
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
-
 # ── Modelos ───────────────────────────────────────────────────────────────────
 class Receptor(BaseModel):
+    tipo_doc: str = "NIT" # NUEVO CAMPO
     numDocumento: str = ""
     nombre: str = ""
     nrc: str = ""
@@ -53,7 +25,7 @@ class Item(BaseModel):
     descripcion: str = ""
     precio: float = 0
     tipo_item: str = "1 - Bien"
-    tipo_venta: str = "Gravado"
+    tipo_venta: str = "Gravado" # NUEVO CAMPO
 
 class FacturaRequest(BaseModel):
     nit_empresa: str = ""
@@ -66,17 +38,10 @@ class FacturaRequest(BaseModel):
     condicion: str = "Contado"
     observaciones: str = ""
 
-# ── Constantes ────────────────────────────────────────────────────────────────
-FP_MAP = {
-    "01": "0: 01", "02": "1: 02", "03": "2: 03", "04": "3: 04", 
-    "05": "4: 05", "07": "1: 02", "99": "11: 99"
-}
+# ── Constantes y Helpers ──────────────────────────────────────────────────────
+FP_MAP = {"01": "0: 01", "02": "1: 02", "03": "2: 03", "04": "3: 04", "05": "4: 05", "07": "1: 02", "99": "11: 99"}
+TIPO_ITEM_MAP = {"1 - Bien": "1 - Bien", "2 - Servicio": "2 - Servicio", "3 - Bien y servicio": "3 - Bien y servicio"}
 
-TIPO_ITEM_MAP = {
-    "1 - Bien": "1 - Bien", "2 - Servicio": "2 - Servicio", "3 - Bien y servicio": "3 - Bien y servicio",
-}
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def _shot(page) -> str:
     try: return base64.b64encode(page.screenshot(type="jpeg", quality=40)).decode("utf-8")
     except: return ""
@@ -92,15 +57,6 @@ def _extract_uuid(text: str) -> str:
     m = re.search(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", text)
     return m.group(0).upper() if m else ""
 
-def _depto_num(raw: str) -> str:
-    if not raw: return "06"
-    return raw.split(" - ")[0].strip().zfill(2)
-
-def _muni_num(raw: str) -> str:
-    if not raw: return ""
-    return raw.split(" - ")[0].strip()
-
-# ── Funciones Blindadas para Angular ──────────────────────────────────────────
 def type_into(page, selector: str, value: str, timeout: int = 10000) -> bool:
     if not value: return True
     try:
@@ -108,20 +64,13 @@ def type_into(page, selector: str, value: str, timeout: int = 10000) -> bool:
         el.wait_for(state="visible", timeout=timeout)
         el.scroll_into_view_if_needed()
         el.click()
-        el.fill("") # Limpieza nativa
+        el.fill("")
         time.sleep(0.1)
-        el.type(str(value), delay=50) # Escribe directamente en el elemento
+        el.type(str(value), delay=50)
         time.sleep(0.2)
         el.press("Tab")
-        
-        # FORZAR A ANGULAR A RECONOCER EL CAMBIO VÍA JAVASCRIPT
-        try:
-            page.evaluate(f"""(sel) => {{
-                const e = document.querySelector(sel);
-                if(e) {{ e.dispatchEvent(new Event('input', {{bubbles: true}})); e.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-            }}""", selector)
+        try: page.evaluate(f"(sel) => {{ const e = document.querySelector(sel); if(e) {{ e.dispatchEvent(new Event('input', {{bubbles: true}})); e.dispatchEvent(new Event('change', {{bubbles: true}})); }} }}", selector)
         except: pass
-        
         return True
     except Exception as e:
         print(f"  [ERROR] type_into '{selector}': {e}")
@@ -150,12 +99,10 @@ def fill_ngselect(page, selector: str, search: str, timeout: int = 8000) -> bool
         comp.scroll_into_view_if_needed()
         comp.click(force=True)
         time.sleep(0.5)
-
         inp = comp.locator("input[type='text']").first
         inp.wait_for(state="visible", timeout=3000)
         inp.type(cod, delay=50)
         time.sleep(1.5)
-
         opt = page.locator("div.ng-option:not(.ng-option-disabled)").first
         opt.wait_for(state="visible", timeout=5000)
         opt.click(force=True)
@@ -165,7 +112,26 @@ def fill_ngselect(page, selector: str, search: str, timeout: int = 8000) -> bool
         print(f"  [ERROR] ng-select '{selector}': {e}")
         return False
 
-# ── PROCESO PRINCIPAL ─────────────────────────────────────────────────────────
+# ── ENDPOINTS ─────────────────────────────────────────────────────────────────
+@app.get("/ping")
+def ping(): return {"status": "ok"}
+
+@app.get("/status/{task_id}")
+def verificar_status(task_id: str): return TAREAS.get(task_id, {"status": "no_encontrado"})
+
+@app.post("/facturar")
+async def facturar_inmediato(request: Request, bg_tasks: BackgroundTasks):
+    try:
+        body_bytes = await request.body()
+        data = json.loads(body_bytes.decode("utf-8"))
+        req  = FacturaRequest(**data)
+        task_id = str(uuid.uuid4())
+        bg_tasks.add_task(procesar_dte_en_fondo, task_id, req)
+        return JSONResponse({"exito": True, "task_id": task_id, "status": "procesando"})
+    except Exception as e:
+        return JSONResponse({"exito": False, "error": f"Error parseando datos: {str(e)}"}, status_code=400)
+
+# ── PROCESO PRINCIPAL (RESTAURADO A TU LÓGICA ORIGINAL) ───────────────────────
 def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
     TAREAS[task_id] = {"status": "procesando", "mensaje": "Iniciando navegador...", "screenshot": ""}
 
@@ -182,41 +148,37 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
     page = None
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
-            )
-            context = browser.new_context(
-                viewport={"width": 1366, "height": 768},
-                accept_downloads=True,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
+            browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"])
+            context = browser.new_context(viewport={"width": 1366, "height": 768}, accept_downloads=True, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             page = context.new_page()
 
-            # ── 1. LOGIN DIRECTO AL PORTAL INTERNO (Evita el problema de pestañas) ──
-            _rep(task_id, "Entrando al portal de Hacienda...", page)
-            page.goto("https://admin.factura.gob.sv/", wait_until="networkidle")
+            # ── 1. LOGIN (LÓGICA DE NUEVA PESTAÑA RESTAURADA) ──
+            _rep(task_id, "Entrando a factura.gob.sv...", page)
+            page.goto("https://factura.gob.sv/", wait_until="domcontentloaded")
+            
+            with context.expect_page() as npi:
+                page.click("text=Ingresar")
+            page = npi.value
+            page.wait_for_load_state("domcontentloaded")
             time.sleep(1.5)
 
-            # Si aparece la tarjeta de "Emisores DTE"
+            # Clic en el botón azul "Emisores DTE" (El de tu captura de pantalla)
+            _rep(task_id, "Buscando botón Emisores DTE...", page)
             try:
-                btn_emisores = page.locator("button:has-text('Ingresar'), button:has-text('Emisores')").first
-                if btn_emisores.is_visible(timeout=3000):
+                btn_emisores = page.locator("button:has-text('Iniciar Sesión'), button:has-text('Emisores DTE')").first
+                if btn_emisores.is_visible(timeout=5000):
                     btn_emisores.click()
                     time.sleep(1)
             except: pass
 
             _rep(task_id, "Escribiendo credenciales...", page)
-            
-            # Selectores robustos para el Login
-            nit_input = page.locator("input[formcontrolname='usuario'], input[placeholder*='NIT'], input[placeholder*='DUI']").first
+            nit_input = page.locator("input[placeholder*='NIT'], input[placeholder*='DUI'], input[formcontrolname='usuario']").first
             nit_input.wait_for(state="visible", timeout=10000)
             nit_input.fill(hw_user.replace("-", ""))
 
-            pass_input = page.locator("input[formcontrolname='clave'], input[type='password']").first
+            pass_input = page.locator("input[type='password'], input[formcontrolname='clave']").first
             pass_input.fill(hw_pass)
 
-            # Ambiente pruebas
             try:
                 sa = page.locator("select[formcontrolname='ambiente']").first
                 sa.wait_for(state="visible", timeout=3000)
@@ -260,7 +222,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             nit_clean = r.numDocumento.replace("-", "").strip()
 
             if not ("Crédito Fiscal" in tipo_dte or es_nota):
-                select_into(page, "select[formcontrolname='tipoDocumento']", label="NIT")
+                select_into(page, "select[formcontrolname='tipoDocumento']", label=r.tipo_doc)
 
             ok_nit = type_into(page, "input[formcontrolname='nit']", nit_clean, timeout=5000)
             if not ok_nit: type_into(page, "input[placeholder*='NIT'], input[formcontrolname='numDocumento']", nit_clean)
@@ -271,9 +233,9 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                 if r.nrc: type_into(page, "input[formcontrolname='nrc']", r.nrc.replace("-", ""))
                 if r.codActividad: fill_ngselect(page, "ng-select[formcontrolname='actividadEconomica']", r.codActividad)
 
-            select_into(page, "select[formcontrolname='departamento']", value=_depto_num(r.departamento))
+            select_into(page, "select[formcontrolname='departamento']", value=r.departamento.split(" - ")[0].strip().zfill(2) if r.departamento else "06")
             time.sleep(0.5)
-            select_into(page, "select[formcontrolname='municipio']", value=_muni_num(r.municipio))
+            select_into(page, "select[formcontrolname='municipio']", value=r.municipio.split(" - ")[0].strip() if r.municipio else "")
 
             type_into(page, "textarea[formcontrolname='complemento']", r.direccion or "San Salvador")
             if r.correo: type_into(page, "input[formcontrolname='correo']", r.correo)
@@ -340,7 +302,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
                     time.sleep(1)
                 except: pass
             else:
-                select_into(page, "select[formcontrolname='condicionOperacion']", label="Contado")
+                select_into(page, "select[formcontrolname='condicionOperacion']", label=req.condicion)
 
             # ── 7. GENERAR Y FIRMAR ──
             _rep(task_id, "Generando documento...", page)
@@ -391,6 +353,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             # ── 9. DESCARGAR PDF Y JSON ──
             _rep(task_id, f"¡Aprobado! Descargando archivos (UUID: {codigo_generacion})...", page)
             pdf_base64 = ""
+            sello_recepcion = "SELLO-NO-ENCONTRADO"
             try:
                 from urllib.parse import urlparse
                 base_url = f"{urlparse(page.url).scheme}://{urlparse(page.url).netloc}"
@@ -420,7 +383,7 @@ def procesar_dte_en_fondo(task_id: str, req: FacturaRequest):
             TAREAS[task_id] = {
                 "status": "completado",
                 "exito": True,
-                "sello_recepcion": "IMPRESO-EN-EL-PDF",
+                "sello_recepcion": sello_recepcion,
                 "codigo_generacion": codigo_generacion,
                 "pdf_base64": pdf_base64,
                 "json_content": "{}"
